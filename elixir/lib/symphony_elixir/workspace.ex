@@ -1241,8 +1241,18 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp hooks_timeout_ms(%Schema{hooks: hooks}) when is_map(hooks) do
-    hooks.timeout_ms || 60_000
+    env_hooks_timeout_ms() || hooks.timeout_ms || 60_000
   end
 
-  defp hooks_timeout_ms(_settings), do: 60_000
+  defp hooks_timeout_ms(_settings), do: env_hooks_timeout_ms() || 60_000
+
+  defp env_hooks_timeout_ms do
+    with value when is_binary(value) <- System.get_env("SYMPHONY_HOOKS_TIMEOUT_MS"),
+         {ms, ""} <- Integer.parse(String.trim(value)),
+         true <- ms > 0 do
+      ms
+    else
+      _ -> nil
+    end
+  end
 end
