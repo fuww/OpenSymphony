@@ -581,7 +581,8 @@ defmodule SymphonyElixir.Workspace do
       issue_id: issue_id,
       issue_identifier: identifier || "issue",
       project_slug: Map.get(issue, :project_slug),
-      project_name: Map.get(issue, :project_name)
+      project_name: Map.get(issue, :project_name),
+      team_key: Map.get(issue, :team_key)
     }
   end
 
@@ -590,7 +591,8 @@ defmodule SymphonyElixir.Workspace do
       issue_id: Map.get(issue, :id),
       issue_identifier: identifier || "issue",
       project_slug: Map.get(issue, :project_slug),
-      project_name: Map.get(issue, :project_name)
+      project_name: Map.get(issue, :project_name),
+      team_key: Map.get(issue, :team_key)
     }
   end
 
@@ -599,7 +601,8 @@ defmodule SymphonyElixir.Workspace do
       issue_id: nil,
       issue_identifier: identifier,
       project_slug: nil,
-      project_name: nil
+      project_name: nil,
+      team_key: nil
     }
   end
 
@@ -608,7 +611,8 @@ defmodule SymphonyElixir.Workspace do
       issue_id: nil,
       issue_identifier: "issue",
       project_slug: nil,
-      project_name: nil
+      project_name: nil,
+      team_key: nil
     }
   end
 
@@ -620,6 +624,11 @@ defmodule SymphonyElixir.Workspace do
 
   defp workspace_roots_for_issue_context(%{project_slug: project_slug} = issue_context, settings)
        when is_binary(project_slug) do
+    [Config.workspace_root_for_issue(issue_context, settings)]
+  end
+
+  defp workspace_roots_for_issue_context(%{team_key: team_key} = issue_context, settings)
+       when is_binary(team_key) do
     [Config.workspace_root_for_issue(issue_context, settings)]
   end
 
@@ -1307,12 +1316,13 @@ defmodule SymphonyElixir.Workspace do
     @repo_branch_prefix <> safe_identifier(issue_context.issue_identifier)
   end
 
-  defp route_issue_context(%{slug: slug}) do
+  defp route_issue_context(%{slug: slug} = route) do
     %{
       issue_id: nil,
       issue_identifier: "__repo_preflight__",
       project_slug: slug,
-      project_name: nil
+      project_name: nil,
+      team_key: route |> Map.get(:teams, []) |> List.first()
     }
   end
 

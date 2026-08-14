@@ -62,7 +62,12 @@ telemetry:
   #   environment: local-dev
 
 projects:
-  - linear_project: project-a
+  # A route can match one or more Linear projects and/or one or more Linear
+  # teams. `linear_project`/`linear_projects` and `team`/`teams` all accept a
+  # single value or a list. When both projects and teams are set, an issue must
+  # match a project AND a team to route here.
+  - linear_projects: [project-a, project-a-extra]
+    teams: [ENG]
     repo: your-org/project-a
     workflow: WORKFLOW.md
     workspace_root: ~/work/symphony-workspaces/project-a
@@ -73,4 +78,12 @@ projects:
     workflow: WORKFLOW.md
     default_branch: main
     workspace_root: ~/work/symphony-workspaces/project-b
+    backend: claude
+
+  # A team-only route collects every issue in the given team(s), regardless of
+  # which Linear project the issue belongs to.
+  - teams: [OPS]
+    repo: your-org/ops
+    workflow: WORKFLOW.md
+    workspace_root: ~/work/symphony-workspaces/ops
     backend: claude

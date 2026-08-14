@@ -171,7 +171,11 @@ opencode:
   command: opencode serve --hostname 127.0.0.1 --port 0
   agent: build
 projects:
-  - linear_project: "project-a"
+  # Match several Linear projects, optionally narrowed to one or more teams.
+  # `linear_project`/`linear_projects` and `team`/`teams` each accept a single
+  # value or a list. With both set, an issue must match a project AND a team.
+  - linear_projects: ["project-a", "project-a-extra"]
+    teams: ["ENG"]
     repo: ./dev/project-a
     workflow: ./dev/project-a/WORKFLOW.md
     workspace_root: ./dev/project-a-workspaces
@@ -179,6 +183,11 @@ projects:
   - linear_project: "project-b"
     repo: ./dev/project-b
     workflow: ./dev/project-b/WORKFLOW.md
+    backend: claude
+  # A team-only route collects every issue in the team, across all its projects.
+  - teams: ["OPS"]
+    repo: ./dev/ops
+    workflow: ./dev/ops/WORKFLOW.md
     backend: claude
 ```
 
@@ -198,8 +207,9 @@ Per-ticket behavior:
 Notes:
 
 - If a value is missing, defaults are used.
-- `projects` lets Symphony poll multiple Linear projects and route each issue by its
-  `project.slugId`.
+- `projects` lets Symphony poll multiple Linear projects and teams and route each issue by its
+  `project.slugId` and/or its team key. A route may list several `linear_projects` and/or
+  `teams`; when both are set an issue must match a project **and** a team to route there.
 - `projects[].repo` is optional. When set, Symphony clones that repo into a brand-new workspace
   before running `hooks.after_create`.
 - `projects[].workflow` is required in `symphony.yml` and must point at the repo-local

@@ -150,16 +150,28 @@ opencode:
   agent: build
 
 projects:
-  - linear_project: project-a
+  # A route can match one or more Linear projects and/or one or more teams.
+  # `linear_project`/`linear_projects` and `team`/`teams` each accept a single
+  # value or a list.
+  - linear_projects: [project-a, project-a-extra]
     repo: ~/dev/project-a
     workflow: ~/dev/project-a/WORKFLOW.md
     workspace_root: ~/work/symphony-workspaces/project-a
     backend: codex
 
+  # With both projects and teams set, an issue must match a project AND a team.
   - linear_project: project-b
+    teams: [ENG]
     repo: ~/dev/project-b
     workflow: ~/dev/project-b/WORKFLOW.md
     workspace_root: ~/work/symphony-workspaces/project-b
+    backend: claude
+
+  # A team-only route collects every issue in the team, across all its projects.
+  - teams: [OPS]
+    repo: ~/dev/ops
+    workflow: ~/dev/ops/WORKFLOW.md
+    workspace_root: ~/work/symphony-workspaces/ops
     backend: claude
 ```
 
@@ -168,8 +180,9 @@ How this works:
 - Symphony polls Linear once using the global `tracker` config
 - `instance.name` labels this Symphony runtime in the dashboard and CLI status UI
 - `server.port` enables the observability dashboard at a fixed port, while CLI `--port` can still override it
-- when it sees a ticket in Linear project `project-a`, it uses the `project-a` repo and workflow
-- when it sees a ticket in Linear project `project-b`, it uses the `project-b` repo and workflow
+- when it sees a ticket in Linear project `project-a` (or `project-a-extra`), it uses the `project-a` repo and workflow
+- when it sees a ticket in Linear project `project-b` that is also in team `ENG`, it uses the `project-b` repo and workflow
+- when it sees any ticket in team `OPS`, it uses the `ops` repo and workflow
 - if a ticket has no backend label, Symphony uses the route backend, then falls back to `agent.backend`
 
 Backend precedence for a ticket, from lowest to highest, is:
@@ -188,7 +201,7 @@ If you prefer to keep the global config beside the repos, relative paths also wo
 
 ## 4. Make sure the Linear projects and states match
 
-The `projects[].linear_project` value must match the Linear project slug (`project.slugId`), not just the display name.
+The `projects[].linear_project` / `projects[].linear_projects` values must match the Linear project slug (`project.slugId`), not just the display name. `projects[].team` / `projects[].teams` must match the Linear team key (the short prefix in issue identifiers, e.g. `ENG` in `ENG-123`).
 
 Symphony expects these workflow states in Linear:
 
@@ -246,7 +259,8 @@ If you add a backend label like `opencode` to a ticket, that label overrides the
 
 ## 7. Common mistakes
 
-- The Linear project slug in `projects[].linear_project` does not match the actual Linear project slug.
+- The Linear project slug in `projects[].linear_project`/`linear_projects` does not match the actual Linear project slug.
+- The team key in `projects[].team`/`teams` does not match the actual Linear team key, or a route sets both a project and a team that no issue satisfies at once.
 - `projects[].workflow` points to a file that does not exist.
 - Repo-local `WORKFLOW.md` includes global config like `tracker`, `worker`, `codex`, `claude`, or `opencode`.
 - `LINEAR_API_KEY` is missing in the shell where Symphony starts.

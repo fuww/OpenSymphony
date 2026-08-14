@@ -1591,6 +1591,162 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "a single project entry can match multiple linear projects" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-multi-project-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      config_path = Path.join(test_root, "symphony.yml")
+      File.mkdir_p!(test_root)
+
+      write_symphony_config_file!(config_path,
+        tracker_kind: "memory",
+        projects: [
+          %{
+            linear_projects: ["project-a", "project-b"],
+            repo: "openai/multi",
+            workflow: "WORKFLOW.md"
+          }
+        ]
+      )
+
+      SymphonyConfig.set_config_file_path(config_path)
+
+      settings = Config.settings!()
+
+      assert [%{slug: "project-a", slugs: ["project-a", "project-b"], teams: []} = route] =
+               Config.linear_project_routes(settings)
+
+      assert route.repo == "openai/multi"
+
+      for slug <- ["project-a", "project-b"] do
+        issue = %Issue{identifier: "PI-1", project_slug: slug}
+        assert %{repo: "openai/multi"} = Config.linear_project_route(issue, settings)
+        assert Config.project_repo_for_issue(issue, settings) == "openai/multi"
+      end
+
+      unmatched = %Issue{identifier: "PI-1", project_slug: "project-c"}
+      assert Config.linear_project_route(unmatched, settings) == nil
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "a project entry narrows routing by team when both project and team are set" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-team-and-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      config_path = Path.join(test_root, "symphony.yml")
+      File.mkdir_p!(test_root)
+
+      write_symphony_config_file!(config_path,
+        tracker_kind: "memory",
+        projects: [
+          %{
+            linear_projects: ["project-a"],
+            teams: ["ENG"],
+            repo: "openai/eng",
+            workflow: "WORKFLOW.md"
+          }
+        ]
+      )
+
+      SymphonyConfig.set_config_file_path(config_path)
+
+      settings = Config.settings!()
+
+      assert [%{slugs: ["project-a"], teams: ["ENG"]}] = Config.linear_project_routes(settings)
+
+      matching = %Issue{identifier: "PI-1", project_slug: "project-a", team_key: "ENG"}
+      assert %{repo: "openai/eng"} = Config.linear_project_route(matching, settings)
+
+      # team key match is case-insensitive
+      matching_lower = %Issue{identifier: "PI-1", project_slug: "project-a", team_key: "eng"}
+      assert %{repo: "openai/eng"} = Config.linear_project_route(matching_lower, settings)
+
+      wrong_team = %Issue{identifier: "PI-1", project_slug: "project-a", team_key: "DES"}
+      assert Config.linear_project_route(wrong_team, settings) == nil
+
+      wrong_project = %Issue{identifier: "PI-1", project_slug: "project-b", team_key: "ENG"}
+      assert Config.linear_project_route(wrong_project, settings) == nil
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "a project entry can route purely by team" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-team-only-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      config_path = Path.join(test_root, "symphony.yml")
+      File.mkdir_p!(test_root)
+
+      write_symphony_config_file!(config_path,
+        tracker_kind: "memory",
+        projects: [
+          %{
+            teams: ["ENG"],
+            repo: "openai/eng",
+            workflow: "WORKFLOW.md"
+          }
+        ]
+      )
+
+      SymphonyConfig.set_config_file_path(config_path)
+
+      settings = Config.settings!()
+
+      assert [%{slug: nil, slugs: [], teams: ["ENG"]}] = Config.linear_project_routes(settings)
+
+      # any project in team ENG routes here, regardless of project slug
+      issue = %Issue{identifier: "PI-1", project_slug: "any-project", team_key: "ENG"}
+      assert %{repo: "openai/eng"} = Config.linear_project_route(issue, settings)
+
+      other_team = %Issue{identifier: "PI-1", project_slug: "any-project", team_key: "OPS"}
+      assert Config.linear_project_route(other_team, settings) == nil
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "config validate rejects a project entry with no linear project or team" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-no-selector-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      config_path = Path.join(test_root, "symphony.yml")
+      File.mkdir_p!(test_root)
+
+      write_symphony_config_file!(config_path,
+        tracker_kind: "memory",
+        projects: [
+          %{repo: "openai/multi", workflow: "WORKFLOW.md"}
+        ]
+      )
+
+      SymphonyConfig.set_config_file_path(config_path)
+
+      assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+      assert message =~ "linear project or team"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "symphony config parses instance name and server port" do
     config_root =
       Path.join(
@@ -1685,7 +1841,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       SymphonyConfig.set_config_file_path(config_path)
 
       assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
-      assert message =~ "duplicate project slug"
+      assert message =~ "duplicate project route"
+      assert message =~ "duplicate"
     after
       File.rm_rf(test_root)
     end

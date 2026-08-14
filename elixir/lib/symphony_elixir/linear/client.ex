@@ -10,8 +10,8 @@ defmodule SymphonyElixir.Linear.Client do
   @max_error_body_log_bytes 1_000
 
   @query """
-  query SymphonyLinearPoll($projectSlugs: [String!]!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) {
-    issues(filter: {project: {slugId: {in: $projectSlugs}}, state: {name: {in: $stateNames}}}, first: $first, after: $after) {
+  query SymphonyLinearPoll($projectSlugs: [String!]!, $teamKeys: [String!]!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) {
+    issues(filter: {state: {name: {in: $stateNames}}, or: [{project: {slugId: {in: $projectSlugs}}}, {team: {key: {in: $teamKeys}}}]}, first: $first, after: $after) {
       nodes {
         id
         identifier
@@ -25,6 +25,9 @@ defmodule SymphonyElixir.Linear.Client do
           id
           slugId
           name
+        }
+        team {
+          key
         }
         branchName
         url
@@ -79,6 +82,9 @@ defmodule SymphonyElixir.Linear.Client do
           slugId
           name
         }
+        team {
+          key
+        }
         branchName
         url
         assignee {
@@ -123,18 +129,18 @@ defmodule SymphonyElixir.Linear.Client do
   def fetch_candidate_issues do
     settings = Config.settings!()
     tracker = settings.tracker
-    project_slugs = settings |> Config.linear_project_routes() |> Enum.map(& &1.slug) |> Enum.uniq()
+    {project_slugs, team_keys} = route_selectors(settings)
 
     cond do
       is_nil(tracker.api_key) ->
         {:error, :missing_linear_api_token}
 
-      project_slugs == [] ->
+      project_slugs == [] and team_keys == [] ->
         {:error, :missing_linear_project_slug}
 
       true ->
         with {:ok, assignee_filter} <- routing_assignee_filter() do
-          do_fetch_by_states(project_slugs, tracker.active_states, assignee_filter)
+          do_fetch_by_states(project_slugs, team_keys, tracker.active_states, assignee_filter)
         end
     end
   end
@@ -148,19 +154,29 @@ defmodule SymphonyElixir.Linear.Client do
     else
       settings = Config.settings!()
       tracker = settings.tracker
-      project_slugs = settings |> Config.linear_project_routes() |> Enum.map(& &1.slug) |> Enum.uniq()
+      {project_slugs, team_keys} = route_selectors(settings)
 
       cond do
         is_nil(tracker.api_key) ->
           {:error, :missing_linear_api_token}
 
-        project_slugs == [] ->
+        project_slugs == [] and team_keys == [] ->
           {:error, :missing_linear_project_slug}
 
         true ->
-          do_fetch_by_states(project_slugs, normalized_states, nil)
+          do_fetch_by_states(project_slugs, team_keys, normalized_states, nil)
       end
     end
+  end
+
+  # Union of project slugs and team keys across every configured route. The poll
+  # filter matches issues in any of these projects OR teams; per-route AND
+  # narrowing (project AND team) happens later in Config.linear_project_route/2.
+  defp route_selectors(settings) do
+    routes = Config.linear_project_routes(settings)
+    project_slugs = routes |> Enum.flat_map(&(Map.get(&1, :slugs) || [])) |> Enum.uniq()
+    team_keys = routes |> Enum.flat_map(&(Map.get(&1, :teams) || [])) |> Enum.uniq()
+    {project_slugs, team_keys}
   end
 
   @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
@@ -254,14 +270,15 @@ defmodule SymphonyElixir.Linear.Client do
     end
   end
 
-  defp do_fetch_by_states(project_slugs, state_names, assignee_filter) do
-    do_fetch_by_states_page(project_slugs, state_names, assignee_filter, nil, [])
+  defp do_fetch_by_states(project_slugs, team_keys, state_names, assignee_filter) do
+    do_fetch_by_states_page(project_slugs, team_keys, state_names, assignee_filter, nil, [])
   end
 
-  defp do_fetch_by_states_page(project_slugs, state_names, assignee_filter, after_cursor, acc_issues) do
+  defp do_fetch_by_states_page(project_slugs, team_keys, state_names, assignee_filter, after_cursor, acc_issues) do
     with {:ok, body} <-
            graphql(@query, %{
              projectSlugs: project_slugs,
+             teamKeys: team_keys,
              stateNames: state_names,
              first: @issue_page_size,
              relationFirst: @issue_page_size,
@@ -272,7 +289,7 @@ defmodule SymphonyElixir.Linear.Client do
 
       case next_page_cursor(page_info) do
         {:ok, next_cursor} ->
-          do_fetch_by_states_page(project_slugs, state_names, assignee_filter, next_cursor, updated_acc)
+          do_fetch_by_states_page(project_slugs, team_keys, state_names, assignee_filter, next_cursor, updated_acc)
 
         :done ->
           {:ok, finalize_paginated_issues(updated_acc)}
@@ -466,6 +483,7 @@ defmodule SymphonyElixir.Linear.Client do
   defp normalize_issue(issue, assignee_filter) when is_map(issue) do
     assignee = issue["assignee"]
     project = issue["project"]
+    team = issue["team"]
 
     %Issue{
       id: issue["id"],
@@ -477,6 +495,7 @@ defmodule SymphonyElixir.Linear.Client do
       project_id: project_field(project, "id"),
       project_slug: project_field(project, "slugId"),
       project_name: project_field(project, "name"),
+      team_key: project_field(team, "key"),
       branch_name: issue["branchName"],
       url: issue["url"],
       assignee_id: assignee_field(assignee, "id"),
