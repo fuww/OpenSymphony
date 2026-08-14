@@ -113,7 +113,22 @@ defmodule SymphonyElixir.CoreTest do
     assert is_list(Map.get(tracker, "terminal_states"))
 
     projects = Map.get(config, "projects", [])
-    assert Enum.map(projects, &Map.get(&1, "linear_project")) == ["project-a", "project-b"]
+
+    # The example demonstrates every selector shape: a multi-project route
+    # narrowed by team, a single-project route, and a team-only route.
+    assert [multi_project_route, single_project_route, team_only_route] = projects
+
+    assert Map.get(multi_project_route, "linear_projects") == ["project-a", "project-a-extra"]
+    assert Map.get(multi_project_route, "teams") == ["ENG"]
+    assert Map.get(single_project_route, "linear_project") == "project-b"
+    assert Map.get(team_only_route, "teams") == ["OPS"]
+
+    # Every route must select issues by at least one project or team.
+    assert Enum.all?(projects, fn project ->
+             project_selectors(project, ["linear_project", "linear_projects"]) != [] or
+               project_selectors(project, ["team", "teams"]) != []
+           end)
+
     assert Enum.all?(projects, &(is_binary(Map.get(&1, "repo")) and Map.get(&1, "repo") != ""))
     assert Enum.all?(projects, &(is_binary(Map.get(&1, "workflow")) and Map.get(&1, "workflow") != ""))
     assert Enum.all?(projects, &(is_binary(Map.get(&1, "workspace_root")) and Map.get(&1, "workspace_root") != ""))
@@ -923,6 +938,16 @@ defmodule SymphonyElixir.CoreTest do
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
   defp restore_app_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
+
+  defp project_selectors(project, keys) do
+    Enum.flat_map(keys, fn key ->
+      case Map.get(project, key) do
+        value when is_binary(value) and value != "" -> [value]
+        values when is_list(values) -> values
+        _ -> []
+      end
+    end)
+  end
 
   test "fetch issues by states with empty state set is a no-op" do
     assert {:ok, []} = Client.fetch_issues_by_states([])

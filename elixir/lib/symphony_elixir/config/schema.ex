@@ -47,7 +47,14 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
 
     embedded_schema do
+      # `slug` is the primary Linear project slug, kept for display/workspace
+      # naming and derived from the first entry in `slugs`. `slugs` holds every
+      # Linear project slug the route matches; `teams` holds the Linear team
+      # keys (e.g. "ENG") the route matches. When both `slugs` and `teams` are
+      # set an issue must match a slug AND a team to route to this entry.
       field(:slug, :string)
+      field(:slugs, {:array, :string}, default: [])
+      field(:teams, {:array, :string}, default: [])
       field(:repo, :string)
       field(:workflow, :string)
       field(:backend, :string)
@@ -58,13 +65,16 @@ defmodule SymphonyElixir.Config.Schema do
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:slug, :repo, :workflow, :backend, :default_branch, :workspace_root], empty_values: [])
+      |> cast(attrs, [:slug, :slugs, :teams, :repo, :workflow, :backend, :default_branch, :workspace_root], empty_values: [])
+      |> update_change(:slugs, &Schema.normalize_string_list/1)
+      |> update_change(:teams, &Schema.normalize_string_list/1)
       |> update_change(:slug, &Schema.normalize_optional_string/1)
       |> update_change(:repo, &Schema.normalize_optional_string/1)
       |> update_change(:workflow, &Schema.normalize_optional_string/1)
       |> update_change(:backend, &Schema.normalize_optional_string/1)
       |> update_change(:default_branch, &Schema.normalize_optional_string/1)
       |> update_change(:workspace_root, &Schema.normalize_optional_string/1)
+      |> put_primary_slug()
       |> validate_change(:backend, fn :backend, value ->
         cond do
           is_nil(value) ->
@@ -77,7 +87,30 @@ defmodule SymphonyElixir.Config.Schema do
             [backend: "must be one of: codex, opencode, claude"]
         end
       end)
-      |> validate_required([:slug])
+      |> validate_project_selectors()
+    end
+
+    # Ensure `slug` mirrors the first configured project slug so display and
+    # workspace naming keep working; team-only routes leave it nil.
+    defp put_primary_slug(changeset) do
+      slugs = get_field(changeset, :slugs) || []
+
+      case get_field(changeset, :slug) do
+        slug when is_binary(slug) and slug != "" -> changeset
+        _ -> put_change(changeset, :slug, List.first(slugs))
+      end
+    end
+
+    # Every route must select issues by at least one project slug or team.
+    defp validate_project_selectors(changeset) do
+      slugs = get_field(changeset, :slugs) || []
+      teams = get_field(changeset, :teams) || []
+
+      if slugs == [] and teams == [] do
+        add_error(changeset, :slugs, "each project must set a linear project or team")
+      else
+        changeset
+      end
     end
   end
 
@@ -774,13 +807,42 @@ defmodule SymphonyElixir.Config.Schema do
     duplicates =
       changeset
       |> get_field(:projects, [])
-      |> Enum.map(&normalize_optional_string(&1.slug))
-      |> Enum.reject(&is_nil/1)
+      |> Enum.map(&project_routing_signature/1)
+      |> Enum.reject(&(&1 == {[], []}))
       |> duplicate_values()
 
-    Enum.reduce(duplicates, changeset, fn slug, acc ->
-      add_error(acc, :projects, "contains duplicate project slug #{inspect(slug)}")
+    Enum.reduce(duplicates, changeset, fn {slugs, teams}, acc ->
+      add_error(acc, :projects, "contains duplicate project route #{format_routing_signature(slugs, teams)}")
     end)
+  end
+
+  # Two routes with the same set of project slugs AND team keys would match the
+  # same issues ambiguously; the signature makes those collisions detectable
+  # while still allowing the same slug in two routes disambiguated by team.
+  defp project_routing_signature(project) do
+    {normalize_signature_values(Map.get(project, :slugs)), normalize_signature_values(Map.get(project, :teams))}
+  end
+
+  defp normalize_signature_values(values) when is_list(values) do
+    values
+    |> Enum.map(&normalize_optional_string/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.map(&String.downcase/1)
+    |> Enum.sort()
+    |> Enum.uniq()
+  end
+
+  defp normalize_signature_values(_values), do: []
+
+  defp format_routing_signature(slugs, teams) do
+    parts =
+      [
+        if(slugs != [], do: "linear_projects=#{inspect(slugs)}"),
+        if(teams != [], do: "teams=#{inspect(teams)}")
+      ]
+      |> Enum.reject(&is_nil/1)
+
+    Enum.join(parts, " ")
   end
 
   defp changeset(attrs) do
@@ -888,9 +950,14 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp finalize_tracker_project(project, default_workspace_root, base_dir) do
+    slugs = normalize_string_list(project.slugs)
+    teams = normalize_string_list(project.teams)
+
     %{
       project
-      | slug: normalize_optional_string(project.slug),
+      | slug: normalize_optional_string(project.slug) || List.first(slugs),
+        slugs: slugs,
+        teams: teams,
         repo: resolve_repo_value(project.repo, base_dir),
         workflow: resolve_optional_workflow_path_value(project.workflow, base_dir),
         backend: normalize_optional_string(project.backend),
@@ -919,6 +986,25 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   def normalize_optional_string(value), do: value
+
+  @doc false
+  @spec normalize_string_list(term()) :: [String.t()]
+  def normalize_string_list(nil), do: []
+
+  def normalize_string_list(value) when is_binary(value) do
+    case normalize_optional_string(value) do
+      nil -> []
+      trimmed -> [trimmed]
+    end
+  end
+
+  def normalize_string_list(values) when is_list(values) do
+    values
+    |> Enum.flat_map(&normalize_string_list/1)
+    |> Enum.uniq()
+  end
+
+  def normalize_string_list(_value), do: []
 
   @spec normalize_optional_effort(term()) :: term()
   def normalize_optional_effort(nil), do: nil
@@ -998,12 +1084,25 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  # Accept singular (`linear_project`, `team`, `slug`) and plural
+  # (`linear_projects`, `teams`, `slugs`) forms and normalize them into the
+  # canonical `slugs`/`teams` lists the schema casts. Each may be a scalar or a
+  # list. The primary `slug` is the first configured project slug.
   defp normalize_tracker_project_alias(project) when is_map(project) do
-    slug = Map.get(project, "slug") || Map.get(project, "linear_project")
+    slugs = collect_alias_values(project, ["slug", "linear_project", "slugs", "linear_projects"])
+    teams = collect_alias_values(project, ["team", "teams"])
 
     project
-    |> Map.delete("linear_project")
-    |> maybe_put_slug(slug)
+    |> Map.drop(["slug", "linear_project", "slugs", "linear_projects", "team", "teams"])
+    |> Map.put("slugs", slugs)
+    |> Map.put("teams", teams)
+    |> maybe_put_slug(List.first(slugs))
+  end
+
+  defp collect_alias_values(project, keys) do
+    keys
+    |> Enum.flat_map(fn key -> normalize_string_list(Map.get(project, key)) end)
+    |> Enum.uniq()
   end
 
   defp maybe_put_slug(project, nil), do: project
@@ -1311,7 +1410,12 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp flatten_errors(errors, prefix) when is_list(errors) do
-    Enum.map(errors, &(prefix <> " " <> &1))
+    # embeds_many surfaces one error map per element; recurse into those while
+    # still formatting plain string messages.
+    Enum.flat_map(errors, fn
+      entry when is_map(entry) -> flatten_errors(entry, prefix)
+      entry -> [prefix <> " " <> entry]
+    end)
   end
 
   defp translate_error({message, options}) do

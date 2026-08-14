@@ -59,7 +59,9 @@ defmodule SymphonyElixir.Config do
         }
 
   @type linear_project_route :: %{
-          slug: String.t(),
+          slug: String.t() | nil,
+          slugs: [String.t()],
+          teams: [String.t()],
           repo: String.t() | nil,
           workflow: String.t() | nil,
           backend: String.t() | nil,
@@ -434,13 +436,13 @@ defmodule SymphonyElixir.Config do
     routes =
       settings.tracker.projects
       |> List.wrap()
-      |> Enum.filter(&(is_binary(&1.slug) and String.trim(&1.slug) != ""))
+      |> Enum.filter(&route_has_selector?/1)
 
     case routes do
       [] ->
         case settings.tracker.project_slug do
           project_slug when is_binary(project_slug) ->
-            [%{slug: project_slug, repo: nil, workflow: nil, backend: nil, workspace_root: nil}]
+            [%{slug: project_slug, slugs: [project_slug], teams: [], repo: nil, workflow: nil, backend: nil, default_branch: nil, workspace_root: nil}]
 
           _ ->
             []
@@ -493,8 +495,11 @@ defmodule SymphonyElixir.Config do
       %{workspace_root: workspace_root} when is_binary(workspace_root) and workspace_root != "" ->
         workspace_root
 
-      %{slug: slug} when is_binary(slug) and route_count > 1 ->
-        Path.join(settings.workspace.root, safe_workspace_segment(slug))
+      route when is_map(route) and route_count > 1 ->
+        case route_segment(route) do
+          segment when is_binary(segment) -> Path.join(settings.workspace.root, safe_workspace_segment(segment))
+          _ -> settings.workspace.root
+        end
 
       _ ->
         settings.workspace.root
@@ -592,9 +597,10 @@ defmodule SymphonyElixir.Config do
   @spec linear_project_route(map() | String.t() | nil, Schema.t()) :: linear_project_route() | nil
   def linear_project_route(issue_or_identifier, %Schema{} = settings) do
     project_slug = issue_project_slug(issue_or_identifier)
+    team_key = issue_team_key(issue_or_identifier)
 
     Enum.find(linear_project_routes(settings), fn route ->
-      route_matches_project_slug?(route, project_slug)
+      route_matches_issue?(route, project_slug, team_key)
     end)
   end
 
@@ -727,19 +733,21 @@ defmodule SymphonyElixir.Config do
     end
   end
 
-  defp validate_global_project_route(%{slug: slug, workflow: workflow_path} = route) do
+  defp validate_global_project_route(%{workflow: workflow_path} = route) do
+    id = route_display_id(route)
+
     cond do
       not (is_binary(workflow_path) and String.trim(workflow_path) != "") ->
-        {:error, {:invalid_workflow_config, "projects #{inspect(slug)} must set an explicit workflow path"}}
+        {:error, {:invalid_workflow_config, "projects #{inspect(id)} must set an explicit workflow path"}}
 
       not (is_binary(route.repo) and String.trim(route.repo) != "") ->
-        {:error, {:invalid_workflow_config, "projects #{inspect(slug)} must set an explicit repo"}}
+        {:error, {:invalid_workflow_config, "projects #{inspect(id)} must set an explicit repo"}}
 
       local_repo_path?(route.repo) and not File.exists?(route.repo) ->
-        {:error, {:invalid_workflow_config, "projects #{inspect(slug)} repo path does not exist: #{route.repo}"}}
+        {:error, {:invalid_workflow_config, "projects #{inspect(id)} repo path does not exist: #{route.repo}"}}
 
       not repo_relative_workflow_path?(workflow_path) ->
-        {:error, {:invalid_workflow_config, "projects #{inspect(slug)} workflow must be relative to the repo root: #{workflow_path}"}}
+        {:error, {:invalid_workflow_config, "projects #{inspect(id)} workflow must be relative to the repo root: #{workflow_path}"}}
 
       true ->
         :ok
@@ -790,12 +798,58 @@ defmodule SymphonyElixir.Config do
   defp issue_project_slug(%{"project_slug" => project_slug}) when is_binary(project_slug), do: project_slug
   defp issue_project_slug(_issue_or_identifier), do: nil
 
-  defp route_matches_project_slug?(%{slug: route_slug}, project_slug)
-       when is_binary(route_slug) and is_binary(project_slug) do
-    normalize_linear_project_slug(route_slug) == normalize_linear_project_slug(project_slug)
+  defp issue_team_key(%{team_key: team_key}) when is_binary(team_key), do: team_key
+  defp issue_team_key(%{"team_key" => team_key}) when is_binary(team_key), do: team_key
+  defp issue_team_key(_issue_or_identifier), do: nil
+
+  # AND semantics: for each selector the route configures (project slugs and/or
+  # team keys) the issue must match; an unconfigured selector is unconstrained.
+  defp route_matches_issue?(route, project_slug, team_key) do
+    slugs = route_slugs(route)
+    teams = route_teams(route)
+
+    (slugs != [] or teams != []) and
+      (slugs == [] or slug_in?(slugs, project_slug)) and
+      (teams == [] or team_in?(teams, team_key))
   end
 
-  defp route_matches_project_slug?(_route, _project_slug), do: false
+  defp slug_in?(slugs, project_slug) when is_binary(project_slug) do
+    normalized = normalize_linear_project_slug(project_slug)
+    Enum.any?(slugs, &(normalize_linear_project_slug(&1) == normalized))
+  end
+
+  defp slug_in?(_slugs, _project_slug), do: false
+
+  defp team_in?(teams, team_key) when is_binary(team_key) do
+    normalized = normalize_team_key(team_key)
+    Enum.any?(teams, &(normalize_team_key(&1) == normalized))
+  end
+
+  defp team_in?(_teams, _team_key), do: false
+
+  defp route_slugs(route), do: Map.get(route, :slugs) || []
+  defp route_teams(route), do: Map.get(route, :teams) || []
+
+  defp route_has_selector?(route), do: route_slugs(route) != [] or route_teams(route) != []
+
+  # Human-readable identifier for a route, used in config error messages.
+  defp route_display_id(route) do
+    case route_slugs(route) do
+      [_ | _] = slugs -> Enum.join(slugs, ",")
+      _ -> route_teams(route) |> Enum.map_join(",", &("team:" <> &1))
+    end
+  end
+
+  # Workspace directory segment for a route: its primary project slug, or the
+  # first team key for team-only routes.
+  defp route_segment(route) do
+    case Map.get(route, :slug) do
+      slug when is_binary(slug) and slug != "" -> slug
+      _ -> List.first(route_teams(route))
+    end
+  end
+
+  defp normalize_team_key(value) when is_binary(value), do: value |> String.trim() |> String.downcase()
 
   defp normalize_linear_project_slug(value) when is_binary(value) do
     normalized_value = String.downcase(String.trim(value))
@@ -807,12 +861,14 @@ defmodule SymphonyElixir.Config do
   end
 
   defp workspace_root_for_route(route, settings, route_count) do
+    segment = route_segment(route)
+
     case route.workspace_root do
       workspace_root when is_binary(workspace_root) and workspace_root != "" ->
         workspace_root
 
-      _ when route_count > 1 ->
-        Path.join(settings.workspace.root, safe_workspace_segment(route.slug))
+      _ when route_count > 1 and is_binary(segment) ->
+        Path.join(settings.workspace.root, safe_workspace_segment(segment))
 
       _ ->
         settings.workspace.root
