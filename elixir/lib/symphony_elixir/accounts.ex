@@ -260,7 +260,7 @@ defmodule SymphonyElixir.Accounts do
     if accounts_settings.enabled do
       with {:ok, accounts} <- list(backend, settings) do
         accounts
-        |> Enum.filter(&account_matches_host?(&1, worker_host))
+        |> filter_accounts_for_host(worker_host, settings)
         |> select_matching_account(backend, running, accounts_settings, settings)
       end
     else
@@ -278,6 +278,16 @@ defmodule SymphonyElixir.Accounts do
 
       true ->
         select_usable_account(backend, accounts, running, accounts_settings, settings)
+    end
+  end
+
+  # Kubernetes runs use ephemeral pod names, so host-pinned account affinity
+  # cannot match — every pod is equivalent and accounts are host-agnostic.
+  defp filter_accounts_for_host(accounts, worker_host, settings) do
+    if kubernetes_mode?(settings) do
+      accounts
+    else
+      Enum.filter(accounts, &account_matches_host?(&1, worker_host))
     end
   end
 
@@ -1163,6 +1173,9 @@ defmodule SymphonyElixir.Accounts do
   # auth, exactly like running `claude setup-token` directly over SSH. The stored
   # OAuth token is what we isolate and inject into later worker runs.
   defp claude_login_env, do: []
+
+  defp kubernetes_mode?(%{worker: %{mode: "kubernetes"}}), do: true
+  defp kubernetes_mode?(_settings), do: false
 
   defp account_matches_host?(%{worker_host: nil}, nil), do: true
   defp account_matches_host?(%{worker_host: nil}, _worker_host), do: false

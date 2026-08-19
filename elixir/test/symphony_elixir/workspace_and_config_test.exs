@@ -1516,6 +1516,70 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.agent_stall_timeout_ms() == 123_000
   end
 
+  test "kubernetes worker mode parses and exposes the pod template" do
+    pod_template = %{"spec" => %{"containers" => [%{"name" => "runner", "image" => "img"}]}}
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_backend: "codex",
+      worker_mode: "kubernetes",
+      worker_kubernetes: %{
+        namespace: "symphony",
+        max_concurrent_pods: 3,
+        pod_template: pod_template
+      }
+    )
+
+    assert :ok = Config.validate!()
+    assert Config.worker_mode() == :kubernetes
+
+    kubernetes = Config.kubernetes_settings()
+    assert kubernetes.namespace == "symphony"
+    assert kubernetes.max_concurrent_pods == 3
+    assert kubernetes.pod_name_prefix == "symphony"
+    assert kubernetes.active_deadline_seconds == 3600
+    assert kubernetes.pod_template == pod_template
+  end
+
+  test "kubernetes worker mode requires namespace and pod_template" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_backend: "codex",
+      worker_mode: "kubernetes",
+      worker_kubernetes: %{max_concurrent_pods: 2}
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "worker.kubernetes.namespace"
+  end
+
+  test "kubernetes worker mode is mutually exclusive with ssh_hosts" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_backend: "codex",
+      worker_mode: "kubernetes",
+      worker_ssh_hosts: ["worker-01"],
+      worker_kubernetes: %{
+        namespace: "symphony",
+        pod_template: %{"spec" => %{"containers" => [%{"name" => "runner", "image" => "img"}]}}
+      }
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "cannot be combined with `worker.ssh_hosts`"
+  end
+
+  test "kubernetes worker mode is rejected for the local-only opencode backend" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_backend: "opencode",
+      worker_mode: "kubernetes",
+      worker_kubernetes: %{
+        namespace: "symphony",
+        pod_template: %{"spec" => %{"containers" => [%{"name" => "runner", "image" => "img"}]}}
+      }
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "OpenCode v1 is local-only"
+  end
+
   test "config runtime helpers preserve existing behavior when default effort is unset" do
     write_workflow_file!(Workflow.workflow_file_path(), agent_backend: "codex", default_effort: nil)
 

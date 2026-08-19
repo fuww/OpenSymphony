@@ -928,6 +928,29 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, nil) == nil
   end
 
+  test "select_worker_host_for_test mints unique pod names and enforces the global cap in kubernetes mode" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_backend: "codex",
+      worker_mode: "kubernetes",
+      worker_kubernetes: %{
+        namespace: "symphony",
+        max_concurrent_pods: 1,
+        pod_template: %{"spec" => %{"containers" => [%{"name" => "runner", "image" => "img"}]}}
+      }
+    )
+
+    empty = %Orchestrator.State{running: %{}}
+    first = Orchestrator.select_worker_host_for_test(empty, nil, "codex")
+    second = Orchestrator.select_worker_host_for_test(empty, nil, "codex")
+
+    assert is_binary(first)
+    assert String.starts_with?(first, "symphony-")
+    refute first == second
+
+    at_capacity = %Orchestrator.State{running: %{"issue-1" => %{worker_host: "symphony-existing"}}}
+    assert Orchestrator.select_worker_host_for_test(at_capacity, nil, "codex") == :no_worker_capacity
+  end
+
   defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
     slack_ms = if min_remaining_ms < 2_000, do: 2_000, else: 1_000
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)

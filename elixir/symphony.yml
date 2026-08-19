@@ -22,6 +22,47 @@ polling:
 workspace:
   root: ~/work/symphony-workspaces
 
+# Where agents run. Omit this section to run every agent locally on the
+# orchestrator host. `worker.mode` is `ssh` (default) or `kubernetes`; the two
+# transports are mutually exclusive. OpenCode is local-only and rejects both.
+# worker:
+#   # --- SSH workers -------------------------------------------------------
+#   # Each host must already have the agent binaries, git, gh, and credentials.
+#   ssh_hosts:
+#     - worker-01
+#     - worker-02:2200          # optional custom SSH port
+#   max_concurrent_agents_per_host: 4
+#
+#   # --- Kubernetes workers ------------------------------------------------
+#   # Each run gets its own ephemeral pod, created when the run starts and
+#   # deleted the moment it finishes. Requires `kubectl` on the orchestrator
+#   # with a working kubeconfig / in-cluster credentials.
+#   mode: kubernetes
+#   kubernetes:
+#     namespace: symphony
+#     max_concurrent_pods: 5            # global cap across all runs
+#     # container: runner               # which container to exec into (default: first)
+#     # kubectl_context: my-cluster     # optional --context
+#     # ready_timeout_ms: 120000        # wait-for-Ready timeout (default 120000)
+#     # active_deadline_seconds: 3600   # hard k8s-side lifetime backstop (default 3600)
+#     # Raw pod spec. Symphony injects metadata.name / namespace / labels and
+#     # spec.activeDeadlineSeconds; everything else below is yours.
+#     pod_template:
+#       spec:
+#         terminationGracePeriodSeconds: 5
+#         containers:
+#           # The image MUST contain bash, git, gh, and the agent binary
+#           # (codex/claude). Symphony execs `bash -lc ...` into this container
+#           # for every step of a run, so the container must stay alive and idle:
+#           # give it a keep-alive entrypoint that blocks forever rather than
+#           # running the agent (the agent is launched later via kubectl exec).
+#           - name: runner
+#             image: ghcr.io/your-org/symphony-runner:latest
+#             command: ["sleep", "infinity"]   # keep-alive; use ["tail", "-f", "/dev/null"] on busybox
+#             resources:
+#               requests: {cpu: "500m", memory: "1Gi"}
+#               limits: {cpu: "2", memory: "4Gi"}
+
 instance:
   name: local-dev
 

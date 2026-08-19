@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, IssueConfig, PathSafety, ProjectWorkflow, SSH}
+  alias SymphonyElixir.{Config, IssueConfig, PathSafety, ProjectWorkflow, Remote}
   alias SymphonyElixir.Config.Schema
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
@@ -556,7 +556,7 @@ defmodule SymphonyElixir.Workspace do
        when is_binary(worker_host) and is_binary(script) and is_integer(timeout_ms) and timeout_ms > 0 do
     task =
       Task.async(fn ->
-        SSH.run(worker_host, script, stderr_to_stdout: true)
+        Remote.run(worker_host, script, stderr_to_stdout: true)
       end)
 
     case Task.yield(task, timeout_ms) do

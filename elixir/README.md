@@ -243,6 +243,18 @@ Notes:
   `worker.max_concurrent_agents_per_host` are rejected during config validation.
 - OpenCode stays local-only even when other backends use SSH workers. A ticket labeled `opencode`
   runs locally on the orchestrator host.
+- Set `worker.mode: kubernetes` to run each agent in its own ephemeral pod instead of on SSH hosts
+  (the two modes are mutually exclusive). Symphony creates the pod from `worker.kubernetes.pod_template`
+  when a run starts and deletes it when the run finishes, so the pod lives only while the agent uses
+  it. Requires `kubectl` on the orchestrator with a working kubeconfig / in-cluster credentials, and
+  `worker.kubernetes.max_concurrent_pods` caps how many run at once. See `symphony.yml` for a full
+  example.
+- The Kubernetes runner image must contain `bash`, `git`, `gh`, and the agent binary
+  (`codex`/`claude`). Symphony runs every step of a run as `kubectl exec … -- bash -lc …` against the
+  pod, so the container's entrypoint must **keep it alive and idle** (e.g. `command: ["sleep", "infinity"]`)
+  rather than running the agent — the agent is launched later via `kubectl exec`. Symphony injects the
+  pod's name, namespace, labels, and `activeDeadlineSeconds` (a hard lifetime backstop); everything
+  else in `pod_template` is yours.
 - OpenCode permissions are handled automatically for a limited unattended allowlist inside the
   issue workspace. Requests outside the workspace, `external_directory`, unknown permissions, and
   interactive questions are rejected.
