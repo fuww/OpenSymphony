@@ -186,6 +186,52 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Kubernetes do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    alias SymphonyElixir.Config.Schema
+
+    @primary_key false
+    embedded_schema do
+      field(:namespace, :string)
+      field(:pod_template, :map)
+      field(:container, :string)
+      field(:kubectl_context, :string)
+      field(:pod_name_prefix, :string, default: "symphony")
+      field(:ready_timeout_ms, :integer, default: 120_000)
+      field(:active_deadline_seconds, :integer, default: 3600)
+      field(:max_concurrent_pods, :integer)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(
+        attrs,
+        [
+          :namespace,
+          :pod_template,
+          :container,
+          :kubectl_context,
+          :pod_name_prefix,
+          :ready_timeout_ms,
+          :active_deadline_seconds,
+          :max_concurrent_pods
+        ],
+        empty_values: []
+      )
+      |> update_change(:namespace, &Schema.normalize_optional_string/1)
+      |> update_change(:container, &Schema.normalize_optional_string/1)
+      |> update_change(:kubectl_context, &Schema.normalize_optional_string/1)
+      |> update_change(:pod_name_prefix, &Schema.normalize_optional_string/1)
+      |> validate_number(:ready_timeout_ms, greater_than: 0)
+      |> validate_number(:active_deadline_seconds, greater_than: 0)
+      |> validate_number(:max_concurrent_pods, greater_than: 0)
+    end
+  end
+
   defmodule Worker do
     @moduledoc false
     use Ecto.Schema
@@ -195,14 +241,28 @@ defmodule SymphonyElixir.Config.Schema do
     embedded_schema do
       field(:ssh_hosts, {:array, :string}, default: [])
       field(:max_concurrent_agents_per_host, :integer)
+      field(:mode, :string, default: "ssh")
+      embeds_one(:kubernetes, Kubernetes, on_replace: :update)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:ssh_hosts, :max_concurrent_agents_per_host], empty_values: [])
+      |> cast(attrs, [:ssh_hosts, :max_concurrent_agents_per_host, :mode], empty_values: [])
+      |> update_change(:mode, &normalize_mode/1)
+      |> validate_inclusion(:mode, ["ssh", "kubernetes"])
       |> validate_number(:max_concurrent_agents_per_host, greater_than: 0)
+      |> cast_embed(:kubernetes, with: &Kubernetes.changeset/2)
     end
+
+    defp normalize_mode(value) when is_binary(value) do
+      case value |> String.trim() |> String.downcase() do
+        "" -> "ssh"
+        normalized -> normalized
+      end
+    end
+
+    defp normalize_mode(_value), do: "ssh"
   end
 
   defmodule Providers do
@@ -725,7 +785,8 @@ defmodule SymphonyElixir.Config.Schema do
          changeset <- changeset(normalized_config),
          {:ok, settings} <- apply_action(changeset, :validate),
          finalized_settings <- finalize_settings(settings, normalized_config, opts),
-         :ok <- validate_open_code_local_only(finalized_settings) do
+         :ok <- validate_open_code_local_only(finalized_settings),
+         :ok <- validate_worker_mode(finalized_settings) do
       {:ok, finalized_settings}
     else
       {:error, %Ecto.Changeset{} = changeset} ->
@@ -1358,6 +1419,9 @@ defmodule SymphonyElixir.Config.Schema do
       ssh_hosts != [] ->
         {:error, {:invalid_workflow_config, "OpenCode v1 is local-only. Remove `worker.ssh_hosts` from `WORKFLOW.md`."}}
 
+      settings.worker.mode == "kubernetes" ->
+        {:error, {:invalid_workflow_config, "OpenCode v1 is local-only. Remove `worker.mode: kubernetes` from `WORKFLOW.md`."}}
+
       is_integer(settings.worker.max_concurrent_agents_per_host) ->
         {:error, {:invalid_workflow_config, "OpenCode v1 is local-only. Remove `worker.max_concurrent_agents_per_host` from `WORKFLOW.md`."}}
 
@@ -1365,6 +1429,37 @@ defmodule SymphonyElixir.Config.Schema do
         :ok
     end
   end
+
+  defp validate_worker_mode(%__MODULE__{worker: %{mode: "kubernetes"} = worker}) do
+    ssh_hosts =
+      worker.ssh_hosts
+      |> List.wrap()
+      |> Enum.map(&to_string/1)
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+
+    kubernetes = worker.kubernetes
+
+    cond do
+      is_nil(kubernetes) or blank_string?(kubernetes.namespace) ->
+        {:error, {:invalid_workflow_config, "`worker.mode: kubernetes` requires `worker.kubernetes.namespace`."}}
+
+      is_nil(kubernetes.pod_template) or kubernetes.pod_template == %{} ->
+        {:error, {:invalid_workflow_config, "`worker.mode: kubernetes` requires `worker.kubernetes.pod_template`."}}
+
+      ssh_hosts != [] ->
+        {:error, {:invalid_workflow_config, "`worker.mode: kubernetes` cannot be combined with `worker.ssh_hosts`."}}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_worker_mode(%__MODULE__{}), do: :ok
+
+  defp blank_string?(nil), do: true
+  defp blank_string?(value) when is_binary(value), do: String.trim(value) == ""
+  defp blank_string?(_value), do: false
 
   defp resolve_agent_backend(explicit_backend, raw_config) do
     case normalize_optional_string(explicit_backend) do

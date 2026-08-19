@@ -159,6 +159,8 @@ defmodule SymphonyElixir.TestSupport do
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
           worker_ssh_hosts: [],
           worker_max_concurrent_agents_per_host: nil,
+          worker_mode: nil,
+          worker_kubernetes: nil,
           providers_openrouter_api_key: nil,
           accounts_enabled: false,
           accounts_store_root: "~/.symphony/accounts",
@@ -236,6 +238,8 @@ defmodule SymphonyElixir.TestSupport do
     workspace_root = Keyword.get(config, :workspace_root)
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
     worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
+    worker_mode = Keyword.get(config, :worker_mode)
+    worker_kubernetes = Keyword.get(config, :worker_kubernetes)
     providers_openrouter_api_key = Keyword.get(config, :providers_openrouter_api_key)
     accounts_enabled = Keyword.get(config, :accounts_enabled)
     accounts_store_root = Keyword.get(config, :accounts_store_root)
@@ -314,7 +318,7 @@ defmodule SymphonyElixir.TestSupport do
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
         "workspace:",
         "  root: #{yaml_value(workspace_root)}",
-        worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
+        worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host, worker_mode, worker_kubernetes),
         providers_yaml(providers_openrouter_api_key),
         accounts_yaml(
           accounts_enabled,
@@ -435,6 +439,8 @@ defmodule SymphonyElixir.TestSupport do
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
           worker_ssh_hosts: [],
           worker_max_concurrent_agents_per_host: nil,
+          worker_mode: nil,
+          worker_kubernetes: nil,
           providers_openrouter_api_key: nil,
           accounts_enabled: false,
           accounts_store_root: "~/.symphony/accounts",
@@ -509,6 +515,8 @@ defmodule SymphonyElixir.TestSupport do
     workspace_root = Keyword.get(config, :workspace_root)
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
     worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
+    worker_mode = Keyword.get(config, :worker_mode)
+    worker_kubernetes = Keyword.get(config, :worker_kubernetes)
     providers_openrouter_api_key = Keyword.get(config, :providers_openrouter_api_key)
     accounts_enabled = Keyword.get(config, :accounts_enabled)
     accounts_store_root = Keyword.get(config, :accounts_store_root)
@@ -593,7 +601,7 @@ defmodule SymphonyElixir.TestSupport do
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
         "workspace:",
         "  root: #{yaml_value(workspace_root)}",
-        worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
+        worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host, worker_mode, worker_kubernetes),
         providers_yaml(providers_openrouter_api_key),
         accounts_yaml(
           accounts_enabled,
@@ -698,19 +706,34 @@ defmodule SymphonyElixir.TestSupport do
     |> Enum.join("\n")
   end
 
-  defp worker_yaml(ssh_hosts, max_concurrent_agents_per_host)
-       when ssh_hosts in [nil, []] and is_nil(max_concurrent_agents_per_host),
+  defp worker_yaml(ssh_hosts, max_concurrent_agents_per_host, mode, kubernetes)
+       when ssh_hosts in [nil, []] and is_nil(max_concurrent_agents_per_host) and
+              mode in [nil, "ssh"] and is_nil(kubernetes),
        do: nil
 
-  defp worker_yaml(ssh_hosts, max_concurrent_agents_per_host) do
+  defp worker_yaml(ssh_hosts, max_concurrent_agents_per_host, mode, kubernetes) do
     [
       "worker:",
+      mode && "  mode: #{yaml_value(mode)}",
       ssh_hosts not in [nil, []] && "  ssh_hosts: #{yaml_value(ssh_hosts)}",
       !is_nil(max_concurrent_agents_per_host) &&
-        "  max_concurrent_agents_per_host: #{yaml_value(max_concurrent_agents_per_host)}"
+        "  max_concurrent_agents_per_host: #{yaml_value(max_concurrent_agents_per_host)}",
+      kubernetes_yaml(kubernetes)
     ]
     |> Enum.reject(&(&1 in [nil, false]))
     |> Enum.join("\n")
+  end
+
+  defp kubernetes_yaml(nil), do: nil
+
+  defp kubernetes_yaml(kubernetes) when is_map(kubernetes) do
+    lines =
+      Enum.map(kubernetes, fn
+        {:pod_template, template} -> "    pod_template: #{Jason.encode!(template)}"
+        {key, value} -> "    #{key}: #{yaml_value(value)}"
+      end)
+
+    ["  kubernetes:" | lines] |> Enum.join("\n")
   end
 
   defp instance_yaml(nil), do: nil

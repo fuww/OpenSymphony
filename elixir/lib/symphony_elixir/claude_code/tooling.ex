@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.ClaudeCode.Tooling do
   @moduledoc false
 
-  alias SymphonyElixir.{Config, SSH}
+  alias SymphonyElixir.{Config, Remote}
   alias SymphonyElixir.Linear.GraphqlTool
 
   @bundle_root [".symphony", "claude"]
@@ -43,7 +43,7 @@ defmodule SymphonyElixir.ClaudeCode.Tooling do
   defp bootstrap_remote_workspace(workspace, worker_host, linear_enabled?, timeout) do
     script = remote_bootstrap_script(workspace, linear_enabled?)
 
-    case SSH.run(worker_host, script, stderr_to_stdout: true, timeout: timeout) do
+    case Remote.run(worker_host, script, stderr_to_stdout: true, timeout: timeout) do
       {:ok, {_output, 0}} -> :ok
       {:ok, {output, status}} -> {:error, {:claude_tooling_failed, {:remote_bootstrap_failed, worker_host, status, output}}}
       {:error, reason} -> {:error, {:claude_tooling_failed, reason}}

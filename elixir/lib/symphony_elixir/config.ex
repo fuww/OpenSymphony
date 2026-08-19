@@ -174,6 +174,17 @@ defmodule SymphonyElixir.Config do
   @spec agent_backend() :: String.t()
   def agent_backend, do: settings!().agent.backend
 
+  @spec worker_mode() :: :ssh | :kubernetes
+  def worker_mode do
+    case settings!().worker.mode do
+      "kubernetes" -> :kubernetes
+      _ -> :ssh
+    end
+  end
+
+  @spec kubernetes_settings() :: map() | nil
+  def kubernetes_settings, do: settings!().worker.kubernetes
+
   @spec agent_stall_timeout_ms(String.t() | nil) :: non_neg_integer()
   def agent_stall_timeout_ms(backend \\ nil) do
     settings = settings!()

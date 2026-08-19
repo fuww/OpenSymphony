@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Accounts, Codex.DynamicTool, Codex.TraceLog, Config, SSH, Telemetry}
+  alias SymphonyElixir.{Accounts, Codex.DynamicTool, Codex.TraceLog, Config, Remote, Telemetry}
 
   @initialize_id 1
   @thread_start_id 2
@@ -357,7 +357,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp start_port(workspace, worker_host, command, issue, account) when is_binary(worker_host) do
     remote_command = remote_launch_command(workspace, command, issue, account)
-    SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
+    Remote.start_port(worker_host, remote_command, line: @port_line_bytes)
   end
 
   defp remote_launch_command(workspace, command, issue, account) when is_binary(workspace) do

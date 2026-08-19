@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{Accounts, AgentRoute, AgentRunner, Config, IssueConfig, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.K8s.Pod, as: K8sPod
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -76,6 +77,7 @@ defmodule SymphonyElixir.Orchestrator do
       |> initialize_backend_totals(config)
 
     run_terminal_workspace_cleanup()
+    maybe_reap_orphan_pods(config)
     state = schedule_tick(state, 0)
 
     {:ok, state}
@@ -742,7 +744,7 @@ defmodule SymphonyElixir.Orchestrator do
           Logger.warning("Issue route warning for #{issue_context(issue)}: #{warning}")
         end)
 
-        case select_worker_host(state, preferred_worker_host, route.backend) do
+        case select_worker_host(state, preferred_worker_host, route.backend, issue) do
           :no_worker_capacity ->
             Logger.debug("No worker slots available for #{issue_context(issue)} backend=#{route.backend} preferred_worker_host=#{inspect(preferred_worker_host)}")
 
@@ -1055,6 +1057,14 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  # At boot no runs are active, so any lingering runner pods were leaked by a prior
+  # crash that skipped normal teardown. Reap them so they do not accumulate.
+  defp maybe_reap_orphan_pods(%{worker: %{mode: "kubernetes"}} = config) do
+    K8sPod.reap_orphans(config)
+  end
+
+  defp maybe_reap_orphan_pods(_config), do: :ok
+
   defp notify_dashboard do
     StatusDashboard.notify_update()
   end
@@ -1226,28 +1236,61 @@ defmodule SymphonyElixir.Orchestrator do
     Map.put(running_entry, key, value)
   end
 
-  defp select_worker_host(%State{} = state, preferred_worker_host, backend) do
-    if AgentRoute.local_only_backend?(backend || Config.agent_backend()) do
-      nil
-    else
-      case Config.settings!().worker.ssh_hosts do
-        [] ->
-          nil
+  defp select_worker_host(%State{} = state, preferred_worker_host, backend, issue \\ nil) do
+    cond do
+      AgentRoute.local_only_backend?(backend || Config.agent_backend()) ->
+        nil
 
-        hosts ->
-          available_hosts = Enum.filter(hosts, &worker_host_slots_available?(state, &1))
+      Config.worker_mode() == :kubernetes ->
+        select_kubernetes_worker_host(state, preferred_worker_host, issue)
 
-          cond do
-            available_hosts == [] ->
-              :no_worker_capacity
+      true ->
+        select_ssh_worker_host(state, preferred_worker_host)
+    end
+  end
 
-            preferred_worker_host_available?(preferred_worker_host, available_hosts) ->
-              preferred_worker_host
-
-            true ->
-              least_loaded_worker_host(state, available_hosts)
-          end
+  # Pod-per-run: capacity is a single global cap (each run is its own pod, so
+  # per-host counting does not apply) and a fresh unique pod name is minted unless
+  # the caller already supplied one (e.g. a retry reusing its name).
+  defp select_kubernetes_worker_host(%State{} = state, preferred_worker_host, issue) do
+    if kubernetes_capacity_available?(state) do
+      case preferred_worker_host do
+        host when is_binary(host) and host != "" -> host
+        _ -> K8sPod.generate_name(issue)
       end
+    else
+      :no_worker_capacity
+    end
+  end
+
+  defp kubernetes_capacity_available?(%State{} = state) do
+    case Config.kubernetes_settings() do
+      %{max_concurrent_pods: limit} when is_integer(limit) and limit > 0 ->
+        map_size(state.running) < limit
+
+      _ ->
+        true
+    end
+  end
+
+  defp select_ssh_worker_host(%State{} = state, preferred_worker_host) do
+    case Config.settings!().worker.ssh_hosts do
+      [] ->
+        nil
+
+      hosts ->
+        available_hosts = Enum.filter(hosts, &worker_host_slots_available?(state, &1))
+
+        cond do
+          available_hosts == [] ->
+            :no_worker_capacity
+
+          preferred_worker_host_available?(preferred_worker_host, available_hosts) ->
+            preferred_worker_host
+
+          true ->
+            least_loaded_worker_host(state, available_hosts)
+        end
     end
   end
 

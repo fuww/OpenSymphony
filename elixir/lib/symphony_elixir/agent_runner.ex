@@ -11,6 +11,7 @@ defmodule SymphonyElixir.AgentRunner do
   alias SymphonyElixir.Codex.AppServer, as: CodexAppServer
   alias SymphonyElixir.Config
   alias SymphonyElixir.IssueConfig
+  alias SymphonyElixir.K8s.Pod, as: K8sPod
   alias SymphonyElixir.Linear.Issue
   alias SymphonyElixir.OpenCode.Tooling
   alias SymphonyElixir.PromptBuilder
@@ -25,7 +26,7 @@ defmodule SymphonyElixir.AgentRunner do
     route = Keyword.get(opts, :route) || AgentRoute.resolve(issue, issue_config.settings)
     account = Keyword.get(opts, :account)
     # The orchestrator owns host retries so one worker lifetime never hops machines.
-    worker_host = selected_worker_host(Keyword.get(opts, :worker_host), issue_config.settings.worker.ssh_hosts)
+    worker_host = selected_worker_host(Keyword.get(opts, :worker_host), issue_config.settings, issue)
 
     Logger.info(
       "Starting agent run for #{issue_context(issue)} backend=#{route.backend} effort=#{route.effort || "default"} worker_host=#{worker_host_for_log(worker_host)} account=#{account_label(account)}"
@@ -56,6 +57,22 @@ defmodule SymphonyElixir.AgentRunner do
       "Starting worker attempt for #{issue_context(issue)} backend=#{route.backend} effort=#{route.effort || "default"} worker_host=#{worker_host_for_log(worker_host)} account=#{account_label(account)}"
     )
 
+    # In Kubernetes mode the worker_host is an ephemeral pod created here and torn
+    # down in the `after` block below, so the pod lives only while the agent runs.
+    case maybe_create_pod(worker_host, issue, issue_config.settings) do
+      :ok ->
+        try do
+          run_workspace_lifecycle(issue, agent_update_recipient, opts, worker_host, route, issue_config)
+        after
+          maybe_delete_pod(worker_host, issue_config.settings)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp run_workspace_lifecycle(issue, agent_update_recipient, opts, worker_host, route, issue_config) do
     case Workspace.create_for_issue(issue, worker_host, settings: issue_config.settings) do
       {:ok, workspace} ->
         send_worker_runtime_info(agent_update_recipient, issue, worker_host, workspace)
@@ -73,6 +90,20 @@ defmodule SymphonyElixir.AgentRunner do
         {:error, reason}
     end
   end
+
+  defp maybe_create_pod(worker_host, issue, %{worker: %{mode: "kubernetes"}} = settings)
+       when is_binary(worker_host) do
+    K8sPod.create(worker_host, settings, issue)
+  end
+
+  defp maybe_create_pod(_worker_host, _issue, _settings), do: :ok
+
+  defp maybe_delete_pod(worker_host, %{worker: %{mode: "kubernetes"}} = settings)
+       when is_binary(worker_host) do
+    K8sPod.delete(worker_host, settings)
+  end
+
+  defp maybe_delete_pod(_worker_host, _settings), do: :ok
 
   defp run_backend_turns(workspace, issue, update_recipient, opts, worker_host, route) do
     case route.backend do
@@ -335,9 +366,22 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp active_issue_state?(_state_name), do: false
 
-  defp selected_worker_host(nil, []), do: nil
+  defp selected_worker_host(preferred_host, %{worker: %{mode: "kubernetes"}}, issue) do
+    # Each Kubernetes run gets its own ephemeral pod. Honor a name the orchestrator
+    # already generated (and counted for capacity); otherwise mint a fresh one.
+    case preferred_host do
+      host when is_binary(host) and host != "" -> host
+      _ -> K8sPod.generate_name(issue)
+    end
+  end
 
-  defp selected_worker_host(preferred_host, configured_hosts) when is_list(configured_hosts) do
+  defp selected_worker_host(preferred_host, %{worker: %{ssh_hosts: ssh_hosts}}, _issue) do
+    selected_ssh_worker_host(preferred_host, ssh_hosts)
+  end
+
+  defp selected_ssh_worker_host(nil, []), do: nil
+
+  defp selected_ssh_worker_host(preferred_host, configured_hosts) when is_list(configured_hosts) do
     hosts =
       configured_hosts
       |> Enum.map(&String.trim/1)
@@ -390,6 +434,10 @@ defmodule SymphonyElixir.AgentRunner do
       details ->
         "#{message} details=#{inspect(details, limit: 10)}"
     end
+  end
+
+  defp format_run_failure({:pod_start_failed, pod_name, reason}) do
+    "Kubernetes runner pod #{pod_name} failed to start: #{inspect(reason, limit: 10)}"
   end
 
   defp format_run_failure(reason), do: inspect(reason, limit: :infinity, printable_limit: :infinity)

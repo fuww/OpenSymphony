@@ -6,7 +6,7 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
   require Logger
 
   alias SymphonyElixir.ClaudeCode.Tooling
-  alias SymphonyElixir.{Accounts, Config, SSH, Telemetry}
+  alias SymphonyElixir.{Accounts, Config, Remote, Telemetry}
 
   @poll_interval_ms 250
   @port_line_bytes 1_048_576
@@ -184,7 +184,7 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
   end
 
   defp start_port(workspace, worker_host, session_id, settings, issue, account) when is_binary(worker_host) do
-    SSH.start_port(worker_host, remote_launch_command(workspace, session_id, settings, issue, account), line: @port_line_bytes)
+    Remote.start_port(worker_host, remote_launch_command(workspace, session_id, settings, issue, account), line: @port_line_bytes)
   end
 
   defp launch_command(session_id, settings) do
