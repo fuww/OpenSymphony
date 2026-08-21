@@ -240,6 +240,9 @@ defmodule SymphonyElixir.K8s.Pod do
 
   # Force the target container to the stdin-reading keepalive so the pod dies on EOF.
   # Symphony owns the lifecycle contract, so this replaces any command in the template.
+  # `stdin`/`stdinOnce` must be set on the container itself: `kubectl run -i` only adds
+  # them to a container it generates, but `--overrides` supplies the full container spec
+  # and wins, so without these the keepalive's `cat` gets a closed stdin and exits at once.
   defp put_keepalive_command(manifest, k8s) do
     spec = ensure_map(Map.get(manifest, "spec"))
     containers = spec |> Map.get("containers") |> ensure_list()
@@ -247,13 +250,24 @@ defmodule SymphonyElixir.K8s.Pod do
     containers =
       case containers do
         [] ->
-          [%{"name" => "runner", "command" => @keepalive_command}]
+          [
+            %{
+              "name" => "runner",
+              "command" => @keepalive_command,
+              "stdin" => true,
+              "stdinOnce" => true
+            }
+          ]
 
         _ ->
           index = target_container_index(containers, k8s)
 
           List.update_at(containers, index, fn container ->
-            Map.put(ensure_map(container), "command", @keepalive_command)
+            Map.merge(ensure_map(container), %{
+              "command" => @keepalive_command,
+              "stdin" => true,
+              "stdinOnce" => true
+            })
           end)
       end
 

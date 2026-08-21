@@ -46,7 +46,9 @@ defmodule SymphonyElixir.K8s.PodTest do
                %{
                  "name" => "runner",
                  "image" => "img",
-                 "command" => ["/bin/sh", "-c", "cat >/dev/null"]
+                 "command" => ["/bin/sh", "-c", "cat >/dev/null"],
+                 "stdin" => true,
+                 "stdinOnce" => true
                }
              ]
     end
@@ -70,7 +72,10 @@ defmodule SymphonyElixir.K8s.PodTest do
 
       assert [%{"name" => "sidecar"} = sidecar, runner] = manifest["spec"]["containers"]
       refute Map.has_key?(sidecar, "command")
+      refute Map.has_key?(sidecar, "stdin")
       assert runner["command"] == ["/bin/sh", "-c", "cat >/dev/null"]
+      assert runner["stdin"] == true
+      assert runner["stdinOnce"] == true
     end
 
     test "respects a user-provided activeDeadlineSeconds and shareProcessNamespace" do
