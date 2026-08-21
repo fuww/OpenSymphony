@@ -331,6 +331,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec effective_stall_timeout_ms_for_test(map()) :: integer()
+  def effective_stall_timeout_ms_for_test(running_entry) when is_map(running_entry) do
+    effective_stall_timeout_ms(running_entry)
+  end
+
+  @doc false
   @spec should_dispatch_issue_for_test(Issue.t(), term()) :: boolean()
   def should_dispatch_issue_for_test(%Issue{} = issue, %State{} = state) do
     should_dispatch_issue?(issue, state, active_state_set(), terminal_state_set())
@@ -476,7 +482,7 @@ defmodule SymphonyElixir.Orchestrator do
       now = DateTime.utc_now()
 
       Enum.reduce(state.running, state, fn {issue_id, running_entry}, state_acc ->
-        case running_entry_stall_timeout_ms(running_entry) do
+        case effective_stall_timeout_ms(running_entry) do
           timeout_ms when is_integer(timeout_ms) and timeout_ms > 0 ->
             restart_stalled_issue(state_acc, issue_id, running_entry, now, timeout_ms)
 
@@ -1868,6 +1874,30 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp running_entry_stall_timeout_ms(_running_entry), do: Config.agent_stall_timeout_ms()
+
+  # The per-turn stall watchdog measures silence since the last agent activity.
+  # Before the agent emits anything the run is still in the workspace setup phase
+  # (deps fetch, model download, compose boot, db seed) whose only timestamp is
+  # `started_at`, so the normal stall timeout would restart the run mid-setup and
+  # loop forever on cold, ephemeral workers. During that phase we apply the larger
+  # workspace startup budget instead. Once the agent starts emitting activity the
+  # normal stall timeout takes over. A disabled watchdog (0) stays disabled.
+  defp effective_stall_timeout_ms(running_entry) do
+    base = running_entry_stall_timeout_ms(running_entry)
+
+    cond do
+      not (is_integer(base) and base > 0) -> base
+      agent_activity_started?(running_entry) -> base
+      true -> max(base, Config.workspace_startup_timeout_ms())
+    end
+  end
+
+  defp agent_activity_started?(running_entry) when is_map(running_entry) do
+    not is_nil(Map.get(running_entry, :last_agent_timestamp)) or
+      not is_nil(Map.get(running_entry, :last_codex_timestamp))
+  end
+
+  defp agent_activity_started?(_running_entry), do: false
 
   defp record_account_update(running_entry, update, token_delta) when is_map(running_entry) do
     account = Map.get(running_entry, :account)

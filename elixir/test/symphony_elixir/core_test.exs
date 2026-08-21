@@ -98,6 +98,54 @@ defmodule SymphonyElixir.CoreTest do
     assert {:error, {:unsupported_tracker_kind, "123"}} = Config.validate!()
   end
 
+  test "stall watchdog uses the workspace startup budget before the agent emits activity" do
+    write_workflow_file!(Workflow.workflow_file_path())
+
+    startup_ms = Config.workspace_startup_timeout_ms()
+    assert startup_ms == Config.hooks_timeout_ms() + Config.agent_stall_timeout_ms()
+    assert startup_ms > 300_000
+
+    pre_agent = %{
+      backend: "opencode",
+      stall_timeout_ms: 300_000,
+      started_at: DateTime.utc_now(),
+      last_agent_timestamp: nil,
+      last_codex_timestamp: nil
+    }
+
+    # No agent activity yet: the long after_create setup phase is governed by the
+    # startup budget, not the 300s per-turn stall timeout.
+    assert Orchestrator.effective_stall_timeout_ms_for_test(pre_agent) == startup_ms
+
+    # Once the agent starts emitting activity, the normal stall timeout applies.
+    running = %{pre_agent | last_agent_timestamp: DateTime.utc_now()}
+    assert Orchestrator.effective_stall_timeout_ms_for_test(running) == 300_000
+
+    # A disabled watchdog stays disabled even during the setup phase.
+    disabled = %{pre_agent | stall_timeout_ms: 0}
+    assert Orchestrator.effective_stall_timeout_ms_for_test(disabled) == 0
+  end
+
+  test "workspace startup budget honors SYMPHONY_WORKSPACE_STARTUP_TIMEOUT_MS override" do
+    write_workflow_file!(Workflow.workflow_file_path())
+
+    previous = System.get_env("SYMPHONY_WORKSPACE_STARTUP_TIMEOUT_MS")
+    on_exit(fn -> restore_env("SYMPHONY_WORKSPACE_STARTUP_TIMEOUT_MS", previous) end)
+
+    System.put_env("SYMPHONY_WORKSPACE_STARTUP_TIMEOUT_MS", "900000")
+    assert Config.workspace_startup_timeout_ms() == 900_000
+
+    pre_agent = %{
+      backend: "opencode",
+      stall_timeout_ms: 300_000,
+      started_at: DateTime.utc_now(),
+      last_agent_timestamp: nil,
+      last_codex_timestamp: nil
+    }
+
+    assert Orchestrator.effective_stall_timeout_ms_for_test(pre_agent) == 900_000
+  end
+
   test "current symphony.yml and project WORKFLOW.md files are valid and complete" do
     repo_root = File.cwd!()
     symphony_config_path = Path.join(repo_root, "symphony.yml")
