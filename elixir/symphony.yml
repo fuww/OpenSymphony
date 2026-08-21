@@ -34,9 +34,11 @@ workspace:
 #   max_concurrent_agents_per_host: 4
 #
 #   # --- Kubernetes workers ------------------------------------------------
-#   # Each run gets its own ephemeral pod, created when the run starts and
-#   # deleted the moment it finishes. Requires `kubectl` on the orchestrator
-#   # with a working kubeconfig / in-cluster credentials.
+#   # Each run gets its own ephemeral pod, launched with a single `kubectl run -i`
+#   # connection that Symphony holds open for the run. When the run ends (or the
+#   # orchestrator dies) the connection drops and the pod is removed automatically
+#   # (`--rm`) — no manual teardown. Requires `kubectl` on the orchestrator with a
+#   # working kubeconfig / in-cluster credentials.
 #   mode: kubernetes
 #   kubernetes:
 #     namespace: symphony
@@ -45,20 +47,21 @@ workspace:
 #     # kubectl_context: my-cluster     # optional --context
 #     # ready_timeout_ms: 120000        # wait-for-Ready timeout (default 120000)
 #     # active_deadline_seconds: 3600   # hard k8s-side lifetime backstop (default 3600)
-#     # Raw pod spec. Symphony injects metadata.name / namespace / labels and
-#     # spec.activeDeadlineSeconds; everything else below is yours.
+#     # Raw pod spec, passed to `kubectl run --overrides`. Symphony injects
+#     # metadata.name / namespace / labels, spec.activeDeadlineSeconds,
+#     # spec.shareProcessNamespace: true (so the pause container reaps zombies), and
+#     # the container's keep-alive command (it reads stdin and exits on EOF, tying
+#     # the pod to the run's connection). Everything else below is yours.
 #     pod_template:
 #       spec:
 #         terminationGracePeriodSeconds: 5
 #         containers:
 #           # The image MUST contain bash, git, gh, and the agent binary
-#           # (codex/claude). Symphony execs `bash -lc ...` into this container
-#           # for every step of a run, so the container must stay alive and idle:
-#           # give it a keep-alive entrypoint that blocks forever rather than
-#           # running the agent (the agent is launched later via kubectl exec).
+#           # (codex/claude). Symphony execs `bash -lc ...` into this container for
+#           # every step of a run and injects the keep-alive command itself, so you
+#           # do NOT need to set `command` (any value is overridden).
 #           - name: runner
 #             image: ghcr.io/your-org/symphony-runner:latest
-#             command: ["sleep", "infinity"]   # keep-alive; use ["tail", "-f", "/dev/null"] on busybox
 #             resources:
 #               requests: {cpu: "500m", memory: "1Gi"}
 #               limits: {cpu: "2", memory: "4Gi"}

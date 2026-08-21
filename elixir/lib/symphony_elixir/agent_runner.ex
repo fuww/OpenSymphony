@@ -57,14 +57,15 @@ defmodule SymphonyElixir.AgentRunner do
       "Starting worker attempt for #{issue_context(issue)} backend=#{route.backend} effort=#{route.effort || "default"} worker_host=#{worker_host_for_log(worker_host)} account=#{account_label(account)}"
     )
 
-    # In Kubernetes mode the worker_host is an ephemeral pod created here and torn
-    # down in the `after` block below, so the pod lives only while the agent runs.
+    # In Kubernetes mode the worker_host is an ephemeral pod launched here and held
+    # open via a `kubectl run -i` connection; closing that connection in the `after`
+    # block below tears the pod down, so the pod lives only while the agent runs.
     case maybe_create_pod(worker_host, issue, issue_config.settings) do
-      :ok ->
+      {:ok, connection} ->
         try do
           run_workspace_lifecycle(issue, agent_update_recipient, opts, worker_host, route, issue_config)
         after
-          maybe_delete_pod(worker_host, issue_config.settings)
+          maybe_close_pod(connection)
         end
 
       {:error, reason} ->
@@ -96,14 +97,11 @@ defmodule SymphonyElixir.AgentRunner do
     K8sPod.create(worker_host, settings, issue)
   end
 
-  defp maybe_create_pod(_worker_host, _issue, _settings), do: :ok
+  defp maybe_create_pod(_worker_host, _issue, _settings), do: {:ok, nil}
 
-  defp maybe_delete_pod(worker_host, %{worker: %{mode: "kubernetes"}} = settings)
-       when is_binary(worker_host) do
-    K8sPod.delete(worker_host, settings)
-  end
+  defp maybe_close_pod(connection) when is_port(connection), do: K8sPod.close(connection)
 
-  defp maybe_delete_pod(_worker_host, _settings), do: :ok
+  defp maybe_close_pod(_connection), do: :ok
 
   defp run_backend_turns(workspace, issue, update_recipient, opts, worker_host, route) do
     case route.backend do
