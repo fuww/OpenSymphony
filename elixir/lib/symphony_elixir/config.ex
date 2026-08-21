@@ -196,6 +196,45 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @doc """
+  Per-hook timeout budget in milliseconds.
+
+  Honors the `SYMPHONY_HOOKS_TIMEOUT_MS` override first, then the configured
+  `hooks.timeout_ms`, then a 60s default. Mirrors the budget
+  `SymphonyElixir.Workspace` enforces while running workspace lifecycle hooks.
+  """
+  @spec hooks_timeout_ms() :: pos_integer()
+  def hooks_timeout_ms do
+    env_pos_integer_ms("SYMPHONY_HOOKS_TIMEOUT_MS") || settings!().hooks.timeout_ms || 60_000
+  end
+
+  @doc """
+  Grace period in milliseconds for the pre-agent workspace setup phase.
+
+  Before the agent emits its first activity the run is still fetching deps,
+  downloading models, booting compose services and seeding databases via the
+  `after_create`/`before_run` hooks. The per-turn `stall_timeout_ms` watchdog
+  would otherwise restart the run mid-setup, so this larger budget governs that
+  phase instead. Honors `SYMPHONY_WORKSPACE_STARTUP_TIMEOUT_MS`; otherwise
+  defaults to the hook budget plus one stall interval, keeping it always
+  greater than or equal to the hook budget.
+  """
+  @spec workspace_startup_timeout_ms() :: pos_integer()
+  def workspace_startup_timeout_ms do
+    env_pos_integer_ms("SYMPHONY_WORKSPACE_STARTUP_TIMEOUT_MS") ||
+      hooks_timeout_ms() + agent_stall_timeout_ms()
+  end
+
+  defp env_pos_integer_ms(name) do
+    with value when is_binary(value) <- System.get_env(name),
+         {ms, ""} <- Integer.parse(String.trim(value)),
+         true <- ms > 0 do
+      ms
+    else
+      _ -> nil
+    end
+  end
+
   @spec codex_command(String.t() | nil) :: String.t()
   def codex_command(effort \\ nil) do
     command = settings!().codex.command
