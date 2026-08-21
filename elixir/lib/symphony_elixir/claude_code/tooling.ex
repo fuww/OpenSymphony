@@ -43,12 +43,27 @@ defmodule SymphonyElixir.ClaudeCode.Tooling do
   defp bootstrap_remote_workspace(workspace, worker_host, linear_enabled?, timeout) do
     script = remote_bootstrap_script(workspace, linear_enabled?)
 
-    case Remote.run(worker_host, script, stderr_to_stdout: true, timeout: timeout) do
+    # `System.cmd` has no timeout option, so bound the remote run with a Task the
+    # same way the workspace lifecycle does.
+    result = run_with_timeout(fn -> Remote.run(worker_host, script, stderr_to_stdout: true) end, timeout)
+
+    case result do
       {:ok, {_output, 0}} -> :ok
       {:ok, {output, status}} -> {:error, {:claude_tooling_failed, {:remote_bootstrap_failed, worker_host, status, output}}}
       {:error, reason} -> {:error, {:claude_tooling_failed, reason}}
     end
   end
+
+  defp run_with_timeout(fun, timeout) when is_integer(timeout) and timeout > 0 do
+    task = Task.async(fun)
+
+    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+      {:ok, result} -> result
+      _ -> {:error, {:remote_bootstrap_timeout, timeout}}
+    end
+  end
+
+  defp run_with_timeout(fun, _timeout), do: fun.()
 
   defp maybe_write_server(server_path, true) do
     with :ok <- File.write(server_path, GraphqlTool.claude_mcp_server_source()),
