@@ -999,6 +999,28 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(at_capacity, nil, "codex") == :no_worker_capacity
   end
 
+  test "select_worker_host_for_test ignores a preferred pod name in kubernetes mode" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_backend: "codex",
+      worker_mode: "kubernetes",
+      worker_kubernetes: %{
+        namespace: "symphony",
+        max_concurrent_pods: 5,
+        pod_template: %{"spec" => %{"containers" => [%{"name" => "runner", "image" => "img"}]}}
+      }
+    )
+
+    empty = %Orchestrator.State{running: %{}}
+
+    # A retry carries its prior pod name forward as the preferred host. Reusing it would
+    # collide with the not-yet-reaped pod, so each dispatch must mint a fresh name instead.
+    minted = Orchestrator.select_worker_host_for_test(empty, "symphony-old-pod-name", "codex")
+
+    assert is_binary(minted)
+    assert String.starts_with?(minted, "symphony-")
+    refute minted == "symphony-old-pod-name"
+  end
+
   defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
     slack_ms = if min_remaining_ms < 2_000, do: 2_000, else: 1_000
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)

@@ -13,6 +13,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  # A runner pod not owned by any active run and older than this is treated as leaked and
+  # reaped. The grace keeps a pod created between poll cycles (not yet in `running`) safe.
+  @orphan_pod_grace_seconds 300
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -122,6 +125,7 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
     state = maybe_dispatch(state)
+    maybe_reap_stale_pods(state)
     state = schedule_tick(state, state.poll_interval_ms)
     state = %{state | poll_check_in_progress: false}
 
@@ -1071,6 +1075,33 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp maybe_reap_orphan_pods(_config), do: :ok
 
+  # Periodic sweep for pods leaked mid-run — e.g. a pod whose `kubectl run --rm` connection
+  # dropped before it attached, so `--rm` never fired. Never touches pods owned by an active
+  # run (`keep`), and only reaps pods past the grace period to avoid racing a fresh create.
+  defp maybe_reap_stale_pods(%State{} = state) do
+    case Config.settings!() do
+      %{worker: %{mode: "kubernetes"}} = config ->
+        K8sPod.reap_orphans(config,
+          keep: active_pod_names(state),
+          min_age_seconds: @orphan_pod_grace_seconds
+        )
+
+      _ ->
+        :ok
+    end
+  rescue
+    error ->
+      Logger.warning("Skipping stale runner pod reap: #{inspect(error)}")
+      :ok
+  end
+
+  defp active_pod_names(%State{running: running}) do
+    running
+    |> Map.values()
+    |> Enum.map(&Map.get(&1, :worker_host))
+    |> Enum.filter(&(is_binary(&1) and &1 != ""))
+  end
+
   defp notify_dashboard do
     StatusDashboard.notify_update()
   end
@@ -1255,15 +1286,13 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  # Pod-per-run: capacity is a single global cap (each run is its own pod, so
-  # per-host counting does not apply) and a fresh unique pod name is minted unless
-  # the caller already supplied one (e.g. a retry reusing its name).
-  defp select_kubernetes_worker_host(%State{} = state, preferred_worker_host, issue) do
+  # Pod-per-run: capacity is a single global cap (each run is its own pod, so per-host
+  # counting does not apply). Every dispatch — including a retry — mints a fresh pod name;
+  # reusing a prior run's name would collide with its not-yet-reaped pod (`AlreadyExists`)
+  # and leave that pod stranded, so a preferred host is deliberately ignored here.
+  defp select_kubernetes_worker_host(%State{} = state, _preferred_worker_host, issue) do
     if kubernetes_capacity_available?(state) do
-      case preferred_worker_host do
-        host when is_binary(host) and host != "" -> host
-        _ -> K8sPod.generate_name(issue)
-      end
+      K8sPod.generate_name(issue)
     else
       :no_worker_capacity
     end

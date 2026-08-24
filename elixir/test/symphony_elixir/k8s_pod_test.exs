@@ -22,6 +22,29 @@ defmodule SymphonyElixir.K8s.PodTest do
     end
   end
 
+  describe "parse_pod_ages/2" do
+    test "computes each pod's age from its creation timestamp" do
+      # 2026-01-01T00:00:00Z is 100 seconds before `now`.
+      now = DateTime.to_unix(~U[2026-01-01T00:01:40Z])
+
+      output = """
+      symphony-eng-1-aaaa 2026-01-01T00:00:00Z
+      symphony-eng-2-bbbb 2026-01-01T00:01:30Z
+      """
+
+      assert [{"symphony-eng-1-aaaa", 100}, {"symphony-eng-2-bbbb", 10}] =
+               Pod.parse_pod_ages(output, now)
+    end
+
+    test "skips blank lines and treats unparseable timestamps as age 0" do
+      now = DateTime.to_unix(~U[2026-01-01T00:01:40Z])
+
+      output = "\nsymphony-eng-1-aaaa not-a-timestamp\n\n"
+
+      assert [{"symphony-eng-1-aaaa", 0}] = Pod.parse_pod_ages(output, now)
+    end
+  end
+
   describe "build_manifest/3" do
     test "injects name, namespace, labels, activeDeadlineSeconds, share-PID and reader command" do
       k8s = %{
