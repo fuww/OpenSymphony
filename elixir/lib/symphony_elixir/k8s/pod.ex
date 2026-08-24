@@ -20,6 +20,7 @@ defmodule SymphonyElixir.K8s.Pod do
   alias SymphonyElixir.K8s.{Broker, Protocol}
 
   @runner_label "symphony-runner"
+  @default_container_name "runner"
   @max_name_length 63
   @broker_supervisor SymphonyElixir.K8s.BrokerSupervisor
 
@@ -306,6 +307,11 @@ defmodule SymphonyElixir.K8s.Pod do
         "--restart=Never",
         "--rm",
         "-i",
+        # Attach to the reader container explicitly. Without this, a multi-container pod
+        # (e.g. a `dind` sidecar) makes kubectl pick the first container and print a
+        # `Defaulted container "..." out of: ...` banner to stderr, which then shows up as
+        # stray output on the broker's connection.
+        "--container=#{target_container_name(manifest, k8s)}",
         "--pod-running-timeout=#{ready_timeout_seconds(k8s)}s",
         "--overrides=#{Jason.encode!(manifest)}",
         "--command",
@@ -368,7 +374,7 @@ defmodule SymphonyElixir.K8s.Pod do
         [] ->
           [
             %{
-              "name" => "runner",
+              "name" => @default_container_name,
               "command" => reader_command(),
               "stdin" => true,
               "stdinOnce" => true
@@ -396,6 +402,15 @@ defmodule SymphonyElixir.K8s.Pod do
     case Enum.at(containers, target_container_index(containers, k8s)) do
       %{"image" => image} when is_binary(image) and image != "" -> image
       _ -> @runner_label
+    end
+  end
+
+  defp target_container_name(manifest, k8s) do
+    containers = get_in(manifest, ["spec", "containers"]) || []
+
+    case Enum.at(containers, target_container_index(containers, k8s)) do
+      %{"name" => name} when is_binary(name) and name != "" -> name
+      _ -> @default_container_name
     end
   end
 
