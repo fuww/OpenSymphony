@@ -5,18 +5,15 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
 
   require Logger
 
-  alias SymphonyElixir.{Accounts, Config, Remote, Telemetry}
+  alias SymphonyElixir.{Accounts, AgentStream, Config, Remote, Telemetry}
   alias SymphonyElixir.ClaudeCode.Tooling
 
   @poll_interval_ms 250
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
-  @shutdown_grace_ms 500
-  @shutdown_kill_wait_ms 500
-  @shutdown_poll_ms 25
 
   @type session :: %{
-          port: port(),
+          stream: AgentStream.t(),
           metadata: map(),
           session_id: String.t(),
           workspace: Path.t(),
@@ -50,11 +47,11 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
 
     with {:ok, settings} <- Config.claude_runtime_settings(effort: Keyword.get(opts, :effort)),
          {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
-         {:ok, port} <- start_port(expanded_workspace, worker_host, session_id, settings, issue, account) do
+         {:ok, stream} <- start_port(expanded_workspace, worker_host, session_id, settings, issue, account) do
       {:ok,
        %{
-         port: port,
-         metadata: port_metadata(port, worker_host, account),
+         stream: stream,
+         metadata: port_metadata(stream, worker_host, account),
          session_id: session_id,
          workspace: expanded_workspace,
          worker_host: worker_host,
@@ -85,7 +82,7 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
 
     started_at_ms = System.monotonic_time(:millisecond)
 
-    with :ok <- send_turn_input(session.port, prompt),
+    with :ok <- send_turn_input(session.stream, prompt),
          {:ok, response} <- await_turn_result(session, on_message, started_at_ms, nil, nil, "") do
       usage = result_usage(response)
 
@@ -124,9 +121,11 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
   end
 
   @spec stop_session(session()) :: :ok
-  def stop_session(%{port: port}) when is_port(port) do
-    stop_port(port)
+  def stop_session(%{stream: %AgentStream{} = stream}) do
+    AgentStream.close(stream)
   end
+
+  def stop_session(_session), do: :ok
 
   defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
     case Config.validate_workspace_path(workspace) do
@@ -167,24 +166,26 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
     if is_nil(executable) do
       {:error, :bash_not_found}
     else
-      {:ok,
-       Port.open(
-         {:spawn_executable, String.to_charlist(executable)},
-         [
-           :binary,
-           :exit_status,
-           :stderr_to_stdout,
-           args: [~c"-lc", String.to_charlist(launch_command(session_id, settings))],
-           env: port_environment(issue, account),
-           cd: String.to_charlist(workspace),
-           line: @port_line_bytes
-         ]
-       )}
+      port =
+        Port.open(
+          {:spawn_executable, String.to_charlist(executable)},
+          [
+            :binary,
+            :exit_status,
+            :stderr_to_stdout,
+            args: [~c"-lc", String.to_charlist(launch_command(session_id, settings))],
+            env: port_environment(issue, account),
+            cd: String.to_charlist(workspace),
+            line: @port_line_bytes
+          ]
+        )
+
+      {:ok, AgentStream.from_port(port)}
     end
   end
 
   defp start_port(workspace, worker_host, session_id, settings, issue, account) when is_binary(worker_host) do
-    Remote.start_port(
+    Remote.open_agent_stream(
       worker_host,
       remote_launch_command(workspace, session_id, settings, issue, account),
       line: @port_line_bytes
@@ -264,7 +265,7 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
   defp maybe_put_env(entries, _key, false), do: entries
   defp maybe_put_env(entries, key, value), do: [{key, to_string(value)} | entries]
 
-  defp send_turn_input(port, prompt) when is_port(port) and is_binary(prompt) do
+  defp send_turn_input(%AgentStream{} = stream, prompt) when is_binary(prompt) do
     payload =
       Jason.encode!(%{
         "type" => "user",
@@ -274,19 +275,7 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
         }
       }) <> "\n"
 
-    try do
-      case :erlang.port_info(port) do
-        :undefined ->
-          {:error, :port_closed}
-
-        _ ->
-          true = Port.command(port, payload)
-          :ok
-      end
-    rescue
-      ArgumentError ->
-        {:error, :port_closed}
-    end
+    AgentStream.send_input(stream, payload)
   end
 
   defp await_turn_result(
@@ -297,22 +286,29 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
          last_activity_ms,
          pending_line
        ) do
+    # Two message shapes funnel into the same handlers: real port messages (local/SSH)
+    # and broker-forwarded `{:agent_stream, ref, ...}` frames (Kubernetes). Exactly one of
+    # `stream.port` / `stream.ref` is non-nil, so the other set of clauses never matches.
+    port = session.stream.port
+    ref = session.stream.ref
+
     receive do
-      {port, {:data, {:eol, chunk}}} when port == session.port ->
-        line = pending_line <> IO.chardata_to_string(chunk)
-        handle_eol_line(line, session, on_message, started_at_ms, first_activity_ms, last_activity_ms)
+      {^port, {:data, {:eol, chunk}}} ->
+        on_eol_chunk(chunk, session, on_message, started_at_ms, first_activity_ms, last_activity_ms, pending_line)
 
-      {port, {:data, {:noeol, chunk}}} when port == session.port ->
-        await_turn_result(
-          session,
-          on_message,
-          started_at_ms,
-          first_activity_ms,
-          last_activity_ms,
-          pending_line <> IO.chardata_to_string(chunk)
-        )
+      {^port, {:data, {:noeol, chunk}}} ->
+        on_noeol_chunk(chunk, session, on_message, started_at_ms, first_activity_ms, last_activity_ms, pending_line)
 
-      {port, {:exit_status, status}} when port == session.port ->
+      {^port, {:exit_status, status}} ->
+        {:error, {:port_exit, status}}
+
+      {:agent_stream, ^ref, {:data, {:eol, chunk}}} ->
+        on_eol_chunk(chunk, session, on_message, started_at_ms, first_activity_ms, last_activity_ms, pending_line)
+
+      {:agent_stream, ^ref, {:data, {:noeol, chunk}}} ->
+        on_noeol_chunk(chunk, session, on_message, started_at_ms, first_activity_ms, last_activity_ms, pending_line)
+
+      {:agent_stream, ^ref, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
     after
       @poll_interval_ms ->
@@ -320,7 +316,9 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
     end
   end
 
-  defp handle_eol_line(line, session, on_message, started_at_ms, first_activity_ms, last_activity_ms) do
+  defp on_eol_chunk(chunk, session, on_message, started_at_ms, first_activity_ms, last_activity_ms, pending_line) do
+    line = pending_line <> IO.chardata_to_string(chunk)
+
     case handle_stream_line(line, session, on_message) do
       {:continue, activity?} ->
         now_ms = System.monotonic_time(:millisecond)
@@ -342,20 +340,31 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
     end
   end
 
+  defp on_noeol_chunk(chunk, session, on_message, started_at_ms, first_activity_ms, last_activity_ms, pending_line) do
+    await_turn_result(
+      session,
+      on_message,
+      started_at_ms,
+      first_activity_ms,
+      last_activity_ms,
+      pending_line <> IO.chardata_to_string(chunk)
+    )
+  end
+
   defp handle_turn_timeout(session, on_message, started_at_ms, first_activity_ms, last_activity_ms, pending_line) do
     now_ms = System.monotonic_time(:millisecond)
 
     cond do
       turn_timed_out?(session, started_at_ms, now_ms) ->
-        stop_port(session.port)
+        AgentStream.close(session.stream)
         {:error, :turn_timeout}
 
       turn_start_timed_out?(session, started_at_ms, now_ms, first_activity_ms) ->
-        stop_port(session.port)
+        AgentStream.close(session.stream)
         {:error, :turn_start_timeout}
 
       turn_stalled?(session, last_activity_ms, now_ms) ->
-        stop_port(session.port)
+        AgentStream.close(session.stream)
         {:error, :stall_timeout}
 
       true ->
@@ -527,10 +536,10 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
 
   defp issue_title(_issue), do: "agent turn"
 
-  defp port_metadata(port, worker_host, account) when is_port(port) do
+  defp port_metadata(%AgentStream{} = stream, worker_host, account) do
     base_metadata =
-      case :erlang.port_info(port, :os_pid) do
-        {:os_pid, os_pid} ->
+      case AgentStream.os_pid(stream) do
+        os_pid when is_integer(os_pid) ->
           %{agent_server_pid: to_string(os_pid)}
 
         _ ->
@@ -570,85 +579,6 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
   end
 
   defp truncate_output(text), do: text
-
-  defp stop_port(port) when is_port(port) do
-    case :erlang.port_info(port) do
-      :undefined ->
-        :ok
-
-      _ ->
-        terminate_port_os_process(port)
-
-        try do
-          Port.close(port)
-          :ok
-        rescue
-          ArgumentError ->
-            :ok
-        end
-    end
-  end
-
-  defp terminate_port_os_process(port) when is_port(port) do
-    case :erlang.port_info(port, :os_pid) do
-      {:os_pid, os_pid} when is_integer(os_pid) and os_pid > 0 ->
-        terminate_os_process_group(os_pid)
-
-      _ ->
-        :ok
-    end
-  end
-
-  defp terminate_os_process_group(os_pid) do
-    send_process_signal(os_pid, "TERM")
-
-    unless wait_for_process_exit(os_pid, @shutdown_grace_ms) do
-      send_process_signal(os_pid, "KILL")
-      wait_for_process_exit(os_pid, @shutdown_kill_wait_ms)
-    end
-
-    :ok
-  end
-
-  defp send_process_signal(os_pid, signal) do
-    group_target = "-#{os_pid}"
-    pid_target = Integer.to_string(os_pid)
-
-    case System.cmd("kill", ["-#{signal}", "--", group_target], stderr_to_stdout: true) do
-      {_output, 0} ->
-        :ok
-
-      _ ->
-        case System.cmd("kill", ["-#{signal}", "--", pid_target], stderr_to_stdout: true) do
-          {_output, 0} -> :ok
-          _ -> :ok
-        end
-    end
-  rescue
-    _ -> :ok
-  end
-
-  defp wait_for_process_exit(os_pid, remaining_ms) when remaining_ms <= 0 do
-    not os_process_alive?(os_pid)
-  end
-
-  defp wait_for_process_exit(os_pid, remaining_ms) do
-    if os_process_alive?(os_pid) do
-      Process.sleep(@shutdown_poll_ms)
-      wait_for_process_exit(os_pid, remaining_ms - @shutdown_poll_ms)
-    else
-      true
-    end
-  end
-
-  defp os_process_alive?(os_pid) do
-    case System.cmd("kill", ["-0", "--", Integer.to_string(os_pid)], stderr_to_stdout: true) do
-      {_output, 0} -> true
-      _ -> false
-    end
-  rescue
-    _ -> false
-  end
 
   defp emit_message(on_message, event, payload, metadata) do
     message =

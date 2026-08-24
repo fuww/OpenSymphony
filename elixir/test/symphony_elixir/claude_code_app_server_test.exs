@@ -165,7 +165,7 @@ defmodule SymphonyElixir.ClaudeCodeAppServerTest do
         assert {:ok, first_result} =
                  AppServer.run_turn(session, "First turn", issue_fixture("MT-CLAUDE-102", "First turn"))
 
-        refute :erlang.port_info(session.port) == :undefined
+        refute :erlang.port_info(session.stream.port) == :undefined
 
         assert {:ok, second_result} =
                  AppServer.run_turn(session, "Second turn", issue_fixture("MT-CLAUDE-102", "Second turn"))
@@ -273,7 +273,7 @@ defmodule SymphonyElixir.ClaudeCodeAppServerTest do
         assert {:error, :stall_timeout} =
                  AppServer.run_turn(session, "Wait too long", issue_fixture("MT-CLAUDE-104", "Stall timeout"))
 
-        wait_for_port_closed!(session.port)
+        wait_for_port_closed!(session.stream.port)
       after
         AppServer.stop_session(session)
       end
@@ -311,12 +311,12 @@ defmodule SymphonyElixir.ClaudeCodeAppServerTest do
 
       assert :ok = Tooling.bootstrap_workspace(workspace)
       assert {:ok, session} = AppServer.start_session(workspace)
-      assert {:os_pid, os_pid} = :erlang.port_info(session.port, :os_pid)
+      assert {:os_pid, os_pid} = :erlang.port_info(session.stream.port, :os_pid)
       assert os_process_alive?(os_pid)
 
       assert :ok = AppServer.stop_session(session)
 
-      wait_for_port_closed!(session.port)
+      wait_for_port_closed!(session.stream.port)
       wait_for_os_process_exit!(os_pid)
     after
       File.rm_rf(test_root)

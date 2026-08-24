@@ -3,23 +3,28 @@ defmodule SymphonyElixir.K8s.Pod do
 
   # Ephemeral, per-run Kubernetes pods. Each pod is launched with a single
   # `kubectl run -i --rm` process whose stdin the orchestrator holds open for the
-  # whole run (see `create/3`). The pod's PID 1 is a keepalive that reads stdin and
-  # exits on EOF, so closing that connection — or the orchestrator dying — stops the
-  # pod, and `--rm` removes it. Zombie reaping is handled by injecting
-  # `spec.shareProcessNamespace: true` (the pod's `pause` container becomes PID 1 and
-  # reaps). Commands still run via `kubectl exec` (see `SymphonyElixir.K8s`), reusing
-  # the operator's kubeconfig / in-cluster credentials.
+  # whole run (see `create/3`). The pod's PID 1 is the protocol reader from
+  # `SymphonyElixir.K8s.Protocol`: it reads framed commands from stdin, runs them as its
+  # own children (so all output flows to the pod's stdout and is visible via
+  # `kubectl logs`), and exits the moment stdin hits EOF — so closing the connection, or
+  # the orchestrator dying, stops the pod and `--rm` removes it. There is exactly one
+  # `kubectl run` and no `kubectl exec`. The held connection is owned by a
+  # `SymphonyElixir.K8s.Broker` (returned by `create/3`); commands run through it.
+  # Zombie reaping is handled by injecting `spec.shareProcessNamespace: true` (the pod's
+  # `pause` container becomes PID 1 and reaps).
 
   require Logger
 
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.K8s
+  alias SymphonyElixir.K8s.{Broker, Protocol}
 
   @runner_label "symphony-runner"
   @max_name_length 63
+  @broker_supervisor SymphonyElixir.K8s.BrokerSupervisor
 
-  # PID 1 keepalive: read stdin, discard it, and exit the moment stdin hits EOF.
-  @keepalive_command ["/bin/sh", "-c", "cat >/dev/null"]
+  # PID 1 command: the framed protocol reader (bash). See `K8s.Protocol.reader_script/0`.
+  defp reader_command, do: ["/bin/bash", "-c", Protocol.reader_script()]
 
   # `kubectl wait` errors immediately if the pod object does not exist yet, so we
   # bridge the brief create race with a few short retries before the real Ready wait.
@@ -47,26 +52,26 @@ defmodule SymphonyElixir.K8s.Pod do
 
   @doc """
   Launches the pod with a single `kubectl run -i --rm` process and blocks until it
-  is Ready. Returns `{:ok, port}` where `port` is the held connection: keep it open
-  for the run's lifetime and hand it to `close/1` at teardown.
+  is Ready. Returns `{:ok, broker}` where `broker` is the `K8s.Broker` pid that owns the
+  held connection: keep it for the run's lifetime and hand it to `close/1` at teardown.
 
   On any failure the connection is closed and the pod deleted (best effort) so the
   caller never leaks a half-started pod.
   """
-  @spec create(String.t(), Schema.t() | map(), term()) :: {:ok, port()} | {:error, term()}
+  @spec create(String.t(), Schema.t() | map(), term()) :: {:ok, pid()} | {:error, term()}
   def create(pod_name, settings, issue \\ nil) when is_binary(pod_name) do
     k8s = kubernetes(settings)
     issue_id = issue && issue_identifier(issue)
 
     with :ok <- ensure_configured(k8s),
-         {:ok, port} <- start_run_port(pod_name, k8s, issue_id) do
+         {:ok, broker} <- start_broker(pod_name, k8s, issue_id) do
       case wait_ready(pod_name, k8s) do
         :ok ->
           Logger.info("Started symphony runner pod pod=#{pod_name} namespace=#{k8s.namespace}")
-          {:ok, port}
+          {:ok, broker}
 
         {:error, reason} ->
-          _ = safe_close(port)
+          _ = stop_broker(broker)
           _ = delete(pod_name, settings)
           {:error, {:pod_start_failed, pod_name, reason}}
       end
@@ -76,21 +81,18 @@ defmodule SymphonyElixir.K8s.Pod do
     end
   end
 
-  # Opens the `kubectl run -i --rm` connection as a port. No output is expected
-  # (the keepalive discards stdin and writes nothing), so the port stays silent
-  # until it is closed at teardown.
-  defp start_run_port(pod_name, k8s, issue_id) do
+  # Starts a `K8s.Broker` that opens the single `kubectl run -i --rm` connection. The
+  # broker owns the port and multiplexes every command over it (no `kubectl exec`).
+  defp start_broker(pod_name, k8s, issue_id) do
     case K8s.kubectl_executable() do
       {:ok, executable} ->
         args = run_args(build_manifest(pod_name, k8s, issue_id), k8s)
+        spec = {Broker, name: pod_name, executable: executable, args: args}
 
-        port =
-          Port.open(
-            {:spawn_executable, String.to_charlist(executable)},
-            [:binary, args: Enum.map(args, &String.to_charlist/1)]
-          )
-
-        {:ok, port}
+        case DynamicSupervisor.start_child(@broker_supervisor, spec) do
+          {:ok, broker} -> {:ok, broker}
+          {:error, reason} -> {:error, {:broker_start_failed, reason}}
+        end
 
       {:error, reason} ->
         {:error, reason}
@@ -100,11 +102,23 @@ defmodule SymphonyElixir.K8s.Pod do
   end
 
   @doc """
-  Closes the held run connection. Its stdin EOF stops the pod's keepalive command,
-  which — together with `--rm` — deletes the pod. Never raises.
+  Closes the held run connection by stopping its broker. The broker closing its port
+  sends stdin EOF to the reader, which — together with `--rm` — deletes the pod. Never
+  raises. Accepts a broker pid (a raw port is still accepted for safety).
   """
-  @spec close(port() | term()) :: :ok
-  def close(port), do: safe_close(port)
+  @spec close(pid() | port() | term()) :: :ok
+  def close(broker) when is_pid(broker), do: stop_broker(broker)
+  def close(port) when is_port(port), do: safe_close(port)
+  def close(_other), do: :ok
+
+  defp stop_broker(broker) when is_pid(broker) do
+    DynamicSupervisor.terminate_child(@broker_supervisor, broker)
+    :ok
+  catch
+    :exit, _reason -> :ok
+  end
+
+  defp stop_broker(_broker), do: :ok
 
   @doc """
   Deletes the pod. Never raises — a failed delete is logged so leaks are findable.
@@ -179,7 +193,7 @@ defmodule SymphonyElixir.K8s.Pod do
     |> put_metadata(pod_name, k8s, issue_id)
     |> put_active_deadline(k8s)
     |> put_share_process_namespace()
-    |> put_keepalive_command(k8s)
+    |> put_protocol_reader_command(k8s)
   end
 
   @doc false
@@ -199,7 +213,7 @@ defmodule SymphonyElixir.K8s.Pod do
         "--overrides=#{Jason.encode!(manifest)}",
         "--command",
         "--"
-      ] ++ @keepalive_command
+      ] ++ reader_command()
   end
 
   defp put_metadata(manifest, pod_name, k8s, issue_id) do
@@ -242,12 +256,13 @@ defmodule SymphonyElixir.K8s.Pod do
     Map.put(manifest, "spec", Map.put_new(spec, "shareProcessNamespace", true))
   end
 
-  # Force the target container to the stdin-reading keepalive so the pod dies on EOF.
-  # Symphony owns the lifecycle contract, so this replaces any command in the template.
-  # `stdin`/`stdinOnce` must be set on the container itself: `kubectl run -i` only adds
-  # them to a container it generates, but `--overrides` supplies the full container spec
-  # and wins, so without these the keepalive's `cat` gets a closed stdin and exits at once.
-  defp put_keepalive_command(manifest, k8s) do
+  # Force the target container to the stdin-reading protocol reader so the pod dies on
+  # EOF. Symphony owns the lifecycle contract, so this replaces any command in the
+  # template. `stdin`/`stdinOnce` must be set on the container itself: `kubectl run -i`
+  # only adds them to a container it generates, but `--overrides` supplies the full
+  # container spec and wins, so without these the reader gets a closed stdin and exits
+  # at once.
+  defp put_protocol_reader_command(manifest, k8s) do
     spec = ensure_map(Map.get(manifest, "spec"))
     containers = spec |> Map.get("containers") |> ensure_list()
 
@@ -257,7 +272,7 @@ defmodule SymphonyElixir.K8s.Pod do
           [
             %{
               "name" => "runner",
-              "command" => @keepalive_command,
+              "command" => reader_command(),
               "stdin" => true,
               "stdinOnce" => true
             }
@@ -268,7 +283,7 @@ defmodule SymphonyElixir.K8s.Pod do
 
           List.update_at(containers, index, fn container ->
             Map.merge(ensure_map(container), %{
-              "command" => @keepalive_command,
+              "command" => reader_command(),
               "stdin" => true,
               "stdinOnce" => true
             })

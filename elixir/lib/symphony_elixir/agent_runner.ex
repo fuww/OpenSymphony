@@ -57,9 +57,12 @@ defmodule SymphonyElixir.AgentRunner do
       "Starting worker attempt for #{issue_context(issue)} backend=#{route.backend} effort=#{route.effort || "default"} worker_host=#{worker_host_for_log(worker_host)} account=#{account_label(account)}"
     )
 
-    # In Kubernetes mode the worker_host is an ephemeral pod launched here and held
-    # open via a `kubectl run -i` connection; closing that connection in the `after`
-    # block below tears the pod down, so the pod lives only while the agent runs.
+    # In Kubernetes mode the worker_host is an ephemeral pod launched here; its single
+    # `kubectl run -i` connection is owned by a broker (the `connection` handle below).
+    # Closing it in the `after` block tears the pod down, so the pod lives only while the
+    # agent runs. The agent stream always ends (its `after AppServer.stop_session`) before
+    # the trailing `after_run` hook runs inside `run_workspace_lifecycle`, so the broker
+    # is never asked to run a sync command while the agent is streaming.
     case maybe_create_pod(worker_host, issue, issue_config.settings) do
       {:ok, connection} ->
         try do
@@ -99,7 +102,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp maybe_create_pod(_worker_host, _issue, _settings), do: {:ok, nil}
 
-  defp maybe_close_pod(connection) when is_port(connection), do: K8sPod.close(connection)
+  defp maybe_close_pod(connection) when is_pid(connection), do: K8sPod.close(connection)
 
   defp maybe_close_pod(_connection), do: :ok
 

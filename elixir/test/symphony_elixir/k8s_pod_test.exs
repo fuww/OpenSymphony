@@ -1,7 +1,9 @@
 defmodule SymphonyElixir.K8s.PodTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.K8s.Pod
+  alias SymphonyElixir.K8s.{Pod, Protocol}
+
+  @reader_command ["/bin/bash", "-c", Protocol.reader_script()]
 
   describe "generate_name/1" do
     test "produces an RFC-1123-compliant, unique name" do
@@ -21,7 +23,7 @@ defmodule SymphonyElixir.K8s.PodTest do
   end
 
   describe "build_manifest/3" do
-    test "injects name, namespace, labels, activeDeadlineSeconds, share-PID and keepalive command" do
+    test "injects name, namespace, labels, activeDeadlineSeconds, share-PID and reader command" do
       k8s = %{
         namespace: "symphony",
         container: nil,
@@ -46,14 +48,14 @@ defmodule SymphonyElixir.K8s.PodTest do
                %{
                  "name" => "runner",
                  "image" => "img",
-                 "command" => ["/bin/sh", "-c", "cat >/dev/null"],
+                 "command" => @reader_command,
                  "stdin" => true,
                  "stdinOnce" => true
                }
              ]
     end
 
-    test "injects the keepalive command into the configured container" do
+    test "injects the reader command into the configured container" do
       k8s = %{
         namespace: "symphony",
         container: "runner",
@@ -73,7 +75,7 @@ defmodule SymphonyElixir.K8s.PodTest do
       assert [%{"name" => "sidecar"} = sidecar, runner] = manifest["spec"]["containers"]
       refute Map.has_key?(sidecar, "command")
       refute Map.has_key?(sidecar, "stdin")
-      assert runner["command"] == ["/bin/sh", "-c", "cat >/dev/null"]
+      assert runner["command"] == @reader_command
       assert runner["stdin"] == true
       assert runner["stdinOnce"] == true
     end
@@ -118,7 +120,8 @@ defmodule SymphonyElixir.K8s.PodTest do
       assert "--rm" in args
       assert "-i" in args
       assert "--pod-running-timeout=90s" in args
-      assert List.last(args) == "cat >/dev/null"
+      assert List.last(args) == Protocol.reader_script()
+      assert Enum.take(args, -3) == @reader_command
 
       overrides = Enum.find(args, &String.starts_with?(&1, "--overrides="))
       assert overrides

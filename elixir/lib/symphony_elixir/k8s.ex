@@ -1,39 +1,41 @@
 defmodule SymphonyElixir.K8s do
   @moduledoc false
 
-  # Transport peer of `SymphonyElixir.SSH`. Instead of executing a command on a
-  # remote host over `ssh`, it executes the command inside a Kubernetes pod via
-  # `kubectl exec`. Because `kubectl exec` shells out just like `ssh`, both
-  # `run/3` and `start_port/3` are drop-in equivalents of the SSH functions and
-  # `start_port/3` returns a real OTP `port()` for streaming.
+  # Transport peer of `SymphonyElixir.SSH`. Instead of reaching a remote host over `ssh`,
+  # every command for a Kubernetes run travels over the single `kubectl run -i --rm`
+  # connection owned by that run's `SymphonyElixir.K8s.Broker` (resolved by pod name via
+  # the broker registry). There is no `kubectl exec`: `run/3` sends a framed command and
+  # collects its output/exit-status from the broker, and `open_agent_stream/3` starts the
+  # agent over the same connection. All output flows to the pod's stdout, so `kubectl logs`
+  # shows the whole run.
 
+  alias SymphonyElixir.AgentStream
   alias SymphonyElixir.Config
+  alias SymphonyElixir.K8s.Broker
 
   @spec run(String.t(), String.t(), keyword()) ::
           {:ok, {String.t(), non_neg_integer()}} | {:error, term()}
   def run(pod, command, opts \\ []) when is_binary(pod) and is_binary(command) do
-    with {:ok, executable} <- kubectl_executable(),
-         {:ok, k8s} <- kubernetes_settings() do
-      {:ok, System.cmd(executable, exec_args(k8s, pod, command), opts)}
+    with {:ok, _k8s} <- kubernetes_settings(),
+         {:ok, broker} <- broker_for(pod) do
+      Broker.run(broker, command, opts)
     end
   end
 
-  @spec start_port(String.t(), String.t(), keyword()) :: {:ok, port()} | {:error, term()}
-  def start_port(pod, command, opts \\ []) when is_binary(pod) and is_binary(command) do
-    with {:ok, executable} <- kubectl_executable(),
-         {:ok, k8s} <- kubernetes_settings() do
-      line_bytes = Keyword.get(opts, :line)
+  @spec open_agent_stream(String.t(), String.t(), keyword()) ::
+          {:ok, AgentStream.t()} | {:error, term()}
+  def open_agent_stream(pod, command, opts \\ []) when is_binary(pod) and is_binary(command) do
+    with {:ok, _k8s} <- kubernetes_settings(),
+         {:ok, broker} <- broker_for(pod),
+         {:ok, ref} <- Broker.start_agent(broker, command, opts) do
+      {:ok, AgentStream.from_broker(broker, ref)}
+    end
+  end
 
-      port_opts =
-        [
-          :binary,
-          :exit_status,
-          :stderr_to_stdout,
-          args: Enum.map(exec_args(k8s, pod, command), &String.to_charlist/1)
-        ]
-        |> maybe_put_line_option(line_bytes)
-
-      {:ok, Port.open({:spawn_executable, String.to_charlist(executable)}, port_opts)}
+  defp broker_for(pod) do
+    case Broker.whereis(pod) do
+      pid when is_pid(pid) -> {:ok, pid}
+      nil -> {:error, {:no_broker_for_pod, pod}}
     end
   end
 
@@ -46,34 +48,12 @@ defmodule SymphonyElixir.K8s do
     end
   end
 
-  # kubectl exec passes argv directly to the container (no intermediate shell), so
-  # the command travels to `bash -lc` intact without any shell escaping — unlike
-  # SSH, which concatenates its args into one remote shell command line.
-  defp exec_args(k8s, pod, command) do
-    ["exec", "-i"]
-    |> maybe_put_context(k8s)
-    |> Kernel.++(["-n", k8s.namespace])
-    |> maybe_put_container(k8s)
-    |> Kernel.++([pod, "--", "bash", "-lc", command])
-  end
-
   @doc false
   @spec context_args(map()) :: [String.t()]
   def context_args(%{kubectl_context: context}) when is_binary(context) and context != "",
     do: ["--context", context]
 
   def context_args(_k8s), do: []
-
-  defp maybe_put_context(args, k8s), do: args ++ context_args(k8s)
-
-  defp maybe_put_container(args, %{container: container})
-       when is_binary(container) and container != "",
-       do: args ++ ["-c", container]
-
-  defp maybe_put_container(args, _k8s), do: args
-
-  defp maybe_put_line_option(port_opts, nil), do: port_opts
-  defp maybe_put_line_option(port_opts, line_bytes), do: Keyword.put(port_opts, :line, line_bytes)
 
   defp kubernetes_settings do
     case Config.kubernetes_settings() do

@@ -202,6 +202,10 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:namespace, :string)
+      # The runner image must provide `bash`, `mkfifo`, `mktemp`, and a `base64` that
+      # decodes with `-d` or `-D`: the pod's PID 1 is the framed protocol reader (see
+      # `SymphonyElixir.K8s.Protocol`) that runs all commands over the single
+      # `kubectl run -i` connection so every command's output shows in `kubectl logs`.
       field(:pod_template, :map)
       field(:container, :string)
       field(:kubectl_context, :string)

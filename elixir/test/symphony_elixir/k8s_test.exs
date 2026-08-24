@@ -1,28 +1,15 @@
 defmodule SymphonyElixir.K8sTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.AgentStream
   alias SymphonyElixir.K8s
+  alias SymphonyElixir.K8s.{Broker, Protocol}
 
   @pod_template %{
     "spec" => %{"containers" => [%{"name" => "runner", "image" => "ghcr.io/org/runner:latest"}]}
   }
 
   setup do
-    previous_path = System.get_env("PATH")
-    test_root = Path.join(System.tmp_dir!(), "symphony-k8s-#{System.unique_integer([:positive])}")
-    File.mkdir_p!(test_root)
-    trace = Path.join(test_root, "kubectl.trace")
-    fake_kubectl = Path.join(test_root, "kubectl")
-
-    File.write!(fake_kubectl, """
-    #!/bin/sh
-    printf 'ARGV:%s\\n' "$*" >> "#{trace}"
-    exit 0
-    """)
-
-    File.chmod!(fake_kubectl, 0o755)
-    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
-
     write_workflow_file!(Workflow.workflow_file_path(),
       agent_backend: "codex",
       worker_mode: "kubernetes",
@@ -33,41 +20,49 @@ defmodule SymphonyElixir.K8sTest do
       }
     )
 
-    on_exit(fn ->
-      restore_env("PATH", previous_path)
-      File.rm_rf(test_root)
-    end)
-
-    %{trace: trace}
+    :ok
   end
 
-  test "run execs the command inside the pod via kubectl", %{trace: trace} do
-    assert {:ok, {_output, 0}} = K8s.run("symphony-pod-1", "echo hello")
-
-    argv = File.read!(trace)
-    assert argv =~ "exec -i"
-    assert argv =~ "-n symphony-test"
-    assert argv =~ "-c runner"
-    assert argv =~ "symphony-pod-1 -- bash -lc echo hello"
+  # Drives a broker against a local bash process running the real protocol reader, so the
+  # whole transport can be exercised without a cluster or kubectl.
+  defp start_reader_broker(pod) do
+    bash = System.find_executable("bash")
+    {:ok, broker} = Broker.start_link(name: pod, executable: bash, args: ["-c", Protocol.reader_script()])
+    on_exit(fn -> if Process.alive?(broker), do: Process.exit(broker, :kill) end)
+    broker
   end
 
-  test "start_port opens a streaming port on kubectl exec" do
-    assert {:ok, port} = K8s.start_port("symphony-pod-2", "echo hi")
-    assert is_port(port)
+  test "run routes a command to the pod's broker and returns output + exit status" do
+    pod = "symphony-pod-#{System.unique_integer([:positive])}"
+    start_reader_broker(pod)
 
-    receive do
-      {^port, {:exit_status, _status}} -> :ok
-    after
-      2_000 -> :ok
-    end
+    assert {:ok, {output, 0}} = K8s.run(pod, "echo hello")
+    assert output =~ "hello"
+
+    assert {:ok, {_output, 3}} = K8s.run(pod, "exit 3")
   end
 
-  test "returns an error when kubectl is unavailable" do
+  test "run returns an error when no broker exists for the pod" do
+    assert {:error, {:no_broker_for_pod, "missing-pod"}} = K8s.run("missing-pod", "echo hi")
+  end
+
+  test "open_agent_stream returns a broker-backed AgentStream that can be ended" do
+    pod = "symphony-pod-#{System.unique_integer([:positive])}"
+    start_reader_broker(pod)
+
+    assert {:ok, %AgentStream{mode: :broker} = stream} = K8s.open_agent_stream(pod, "cat")
+    assert :ok = AgentStream.close(stream)
+
+    ref = stream.ref
+    assert_receive {:agent_stream, ^ref, {:exit_status, _status}}, 2_000
+  end
+
+  test "kubectl_executable reports when kubectl is missing" do
     previous_path = System.get_env("PATH")
     System.put_env("PATH", "/nonexistent-bin")
 
     on_exit(fn -> restore_env("PATH", previous_path) end)
 
-    assert {:error, :kubectl_not_found} = K8s.run("symphony-pod-3", "echo hi")
+    assert {:error, :kubectl_not_found} = K8s.kubectl_executable()
   end
 end
