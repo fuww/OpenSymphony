@@ -143,6 +143,7 @@ defmodule SymphonyElixir.K8s.PodTest do
       assert "--rm" in args
       assert "-i" in args
       assert "--pod-running-timeout=90s" in args
+      assert "--container=runner" in args
       assert List.last(args) == Protocol.reader_script()
       assert Enum.take(args, -3) == @reader_command
 
@@ -150,6 +151,29 @@ defmodule SymphonyElixir.K8s.PodTest do
       assert overrides
       assert "--overrides=" <> json = overrides
       assert Jason.decode!(json) == manifest
+    end
+
+    test "attaches to the configured container so kubectl does not default-and-warn" do
+      k8s = %{
+        namespace: "symphony",
+        container: "runner",
+        kubectl_context: nil,
+        ready_timeout_ms: 90_000,
+        active_deadline_seconds: nil,
+        pod_template: %{
+          "spec" => %{
+            "containers" => [
+              %{"name" => "runner", "image" => "img"},
+              %{"name" => "dind", "image" => "docker:dind"}
+            ]
+          }
+        }
+      }
+
+      manifest = Pod.build_manifest("symphony-eng-9-abcd", k8s)
+      args = Pod.run_args(manifest, k8s)
+
+      assert "--container=runner" in args
     end
   end
 end

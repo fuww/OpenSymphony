@@ -225,9 +225,20 @@ defmodule SymphonyElixir.K8s.Broker do
 
   defp route_output(line, state) do
     trimmed = String.trim(line)
-    if trimmed != "", do: Logger.debug("Runner pod #{state.name} stray output: #{trimmed}")
+
+    cond do
+      trimmed == "" -> :ok
+      kubectl_attach_banner?(trimmed) -> :ok
+      true -> Logger.debug("Runner pod #{state.name} stray output: #{trimmed}")
+    end
+
     state
   end
+
+  # `kubectl run -i` prints this banner to stderr when it attaches interactively. There
+  # is no flag to suppress it, so drop it instead of logging it as stray pod output.
+  defp kubectl_attach_banner?("If you don't see a command prompt, try pressing enter."), do: true
+  defp kubectl_attach_banner?(_line), do: false
 
   defp drain_queue(%{sync: nil, sync_queue: queue} = state) do
     case :queue.out(queue) do
