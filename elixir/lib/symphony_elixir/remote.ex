@@ -6,7 +6,7 @@ defmodule SymphonyElixir.Remote do
   # caller stays transport-agnostic — only the transport used to reach the host
   # changes, governed by the globally-configured `worker.mode`.
 
-  alias SymphonyElixir.{Config, K8s, SSH}
+  alias SymphonyElixir.{AgentStream, Config, K8s, SSH}
 
   @spec run(String.t(), String.t(), keyword()) ::
           {:ok, {String.t(), non_neg_integer()}} | {:error, term()}
@@ -17,7 +17,26 @@ defmodule SymphonyElixir.Remote do
   @spec start_port(String.t(), String.t(), keyword()) :: {:ok, port()} | {:error, term()}
   def start_port(worker_host, command, opts \\ [])
       when is_binary(worker_host) and is_binary(command) do
-    transport().start_port(worker_host, command, opts)
+    SSH.start_port(worker_host, command, opts)
+  end
+
+  @doc """
+  Opens the agent's bidirectional stream on the worker, returning an `AgentStream` handle.
+  SSH mode wraps a real port; Kubernetes mode goes over the broker-owned connection.
+  """
+  @spec open_agent_stream(String.t(), String.t(), keyword()) ::
+          {:ok, AgentStream.t()} | {:error, term()}
+  def open_agent_stream(worker_host, command, opts \\ [])
+      when is_binary(worker_host) and is_binary(command) do
+    case Config.worker_mode() do
+      :kubernetes ->
+        K8s.open_agent_stream(worker_host, command, opts)
+
+      _ ->
+        with {:ok, port} <- SSH.start_port(worker_host, command, opts) do
+          {:ok, AgentStream.from_port(port)}
+        end
+    end
   end
 
   defp transport do

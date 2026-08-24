@@ -32,6 +32,8 @@ defmodule SymphonyElixir.Application do
     children = [
       {Phoenix.PubSub, name: SymphonyElixir.PubSub},
       {Task.Supervisor, name: SymphonyElixir.TaskSupervisor},
+      {Registry, keys: :unique, name: SymphonyElixir.K8s.BrokerRegistry},
+      {DynamicSupervisor, strategy: :one_for_one, name: SymphonyElixir.K8s.BrokerSupervisor},
       config_store,
       SymphonyElixir.Orchestrator,
       SymphonyElixir.HttpServer,

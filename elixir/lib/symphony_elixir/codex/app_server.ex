@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Accounts, Codex.DynamicTool, Codex.TraceLog, Config, Remote, Telemetry}
+  alias SymphonyElixir.{Accounts, AgentStream, Codex.DynamicTool, Codex.TraceLog, Config, Remote, Telemetry}
 
   @initialize_id 1
   @thread_start_id 2
@@ -13,8 +13,10 @@ defmodule SymphonyElixir.Codex.AppServer do
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
 
+  # `port` holds an `AgentStream` (a real port for local/SSH, or a broker-backed stream
+  # for Kubernetes); the field name is kept for historical reasons across this module.
   @type session :: %{
-          port: port(),
+          port: AgentStream.t(),
           metadata: map(),
           approval_policy: String.t() | map(),
           auto_approve_requests: boolean(),
@@ -67,7 +69,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          }}
       else
         {:error, reason} ->
-          stop_port(port)
+          AgentStream.close(port)
           {:error, reason}
       end
     end
@@ -153,9 +155,11 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   @spec stop_session(session()) :: :ok
-  def stop_session(%{port: port}) when is_port(port) do
-    stop_port(port)
+  def stop_session(%{port: %AgentStream{} = stream}) do
+    AgentStream.close(stream)
   end
+
+  def stop_session(_session), do: :ok
 
   defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
     case Config.validate_workspace_path(workspace) do
@@ -351,13 +355,13 @@ defmodule SymphonyElixir.Codex.AppServer do
           ]
         )
 
-      {:ok, port}
+      {:ok, AgentStream.from_port(port)}
     end
   end
 
   defp start_port(workspace, worker_host, command, issue, account) when is_binary(worker_host) do
     remote_command = remote_launch_command(workspace, command, issue, account)
-    Remote.start_port(worker_host, remote_command, line: @port_line_bytes)
+    Remote.open_agent_stream(worker_host, remote_command, line: @port_line_bytes)
   end
 
   defp remote_launch_command(workspace, command, issue, account) when is_binary(workspace) do
@@ -399,10 +403,10 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp maybe_put_env(entries, _key, false), do: entries
   defp maybe_put_env(entries, key, value), do: [{key, value} | entries]
 
-  defp port_metadata(port, worker_host, account \\ nil) when is_port(port) do
+  defp port_metadata(%AgentStream{} = stream, worker_host, account \\ nil) do
     base_metadata =
-      case :erlang.port_info(port, :os_pid) do
-        {:os_pid, os_pid} ->
+      case AgentStream.os_pid(stream) do
+        os_pid when is_integer(os_pid) ->
           %{codex_app_server_pid: to_string(os_pid)}
 
         _ ->
@@ -520,23 +524,32 @@ defmodule SymphonyElixir.Codex.AppServer do
     )
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+  defp receive_loop(stream, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+    # Two message shapes funnel into the same handler: real port messages (local/SSH) and
+    # broker-forwarded `{:agent_stream, ref, ...}` frames (Kubernetes). Exactly one of
+    # `stream.port` / `stream.ref` is non-nil, so the other clauses never match.
+    real = stream.port
+    ref = stream.ref
+
     receive do
-      {^port, {:data, {:eol, chunk}}} ->
+      {^real, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+        handle_incoming(stream, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
 
-      {^port, {:data, {:noeol, chunk}}} ->
-        receive_loop(
-          port,
-          on_message,
-          timeout_ms,
-          pending_line <> to_string(chunk),
-          tool_executor,
-          auto_approve_requests
-        )
+      {^real, {:data, {:noeol, chunk}}} ->
+        receive_loop(stream, on_message, timeout_ms, pending_line <> to_string(chunk), tool_executor, auto_approve_requests)
 
-      {^port, {:exit_status, status}} ->
+      {^real, {:exit_status, status}} ->
+        {:error, {:port_exit, status}}
+
+      {:agent_stream, ^ref, {:data, {:eol, chunk}}} ->
+        complete_line = pending_line <> to_string(chunk)
+        handle_incoming(stream, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+
+      {:agent_stream, ^ref, {:data, {:noeol, chunk}}} ->
+        receive_loop(stream, on_message, timeout_ms, pending_line <> to_string(chunk), tool_executor, auto_approve_requests)
+
+      {:agent_stream, ^ref, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
     after
       timeout_ms ->
@@ -1106,16 +1119,29 @@ defmodule SymphonyElixir.Codex.AppServer do
     with_timeout_response(port, request_id, Config.settings!().codex.read_timeout_ms, "")
   end
 
-  defp with_timeout_response(port, request_id, timeout_ms, pending_line) do
+  defp with_timeout_response(stream, request_id, timeout_ms, pending_line) do
+    real = stream.port
+    ref = stream.ref
+
     receive do
-      {^port, {:data, {:eol, chunk}}} ->
+      {^real, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_response(port, request_id, complete_line, timeout_ms)
+        handle_response(stream, request_id, complete_line, timeout_ms)
 
-      {^port, {:data, {:noeol, chunk}}} ->
-        with_timeout_response(port, request_id, timeout_ms, pending_line <> to_string(chunk))
+      {^real, {:data, {:noeol, chunk}}} ->
+        with_timeout_response(stream, request_id, timeout_ms, pending_line <> to_string(chunk))
 
-      {^port, {:exit_status, status}} ->
+      {^real, {:exit_status, status}} ->
+        {:error, {:port_exit, status}}
+
+      {:agent_stream, ^ref, {:data, {:eol, chunk}}} ->
+        complete_line = pending_line <> to_string(chunk)
+        handle_response(stream, request_id, complete_line, timeout_ms)
+
+      {:agent_stream, ^ref, {:data, {:noeol, chunk}}} ->
+        with_timeout_response(stream, request_id, timeout_ms, pending_line <> to_string(chunk))
+
+      {:agent_stream, ^ref, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
     after
       timeout_ms ->
@@ -1184,22 +1210,6 @@ defmodule SymphonyElixir.Codex.AppServer do
     }
   end
 
-  defp stop_port(port) when is_port(port) do
-    case :erlang.port_info(port) do
-      :undefined ->
-        :ok
-
-      _ ->
-        try do
-          Port.close(port)
-          :ok
-        rescue
-          ArgumentError ->
-            :ok
-        end
-    end
-  end
-
   defp emit_message(on_message, event, details, metadata) when is_function(on_message, 1) do
     message =
       metadata
@@ -1256,9 +1266,9 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp tool_call_arguments(_params), do: %{}
 
-  defp send_message(port, message) do
+  defp send_message(%AgentStream{} = stream, message) do
     line = Jason.encode!(message) <> "\n"
-    Port.command(port, line)
+    AgentStream.send_input(stream, line)
   end
 
   defp needs_input?(method, payload)
