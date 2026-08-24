@@ -67,17 +67,34 @@ defmodule SymphonyElixir.K8s.Pod do
          {:ok, broker} <- start_broker(pod_name, k8s, issue_id) do
       case wait_ready(pod_name, k8s) do
         :ok ->
-          Logger.info("Started symphony runner pod pod=#{pod_name} namespace=#{k8s.namespace}")
-          {:ok, broker}
+          confirm_broker_started(broker, pod_name, settings, k8s)
 
         {:error, reason} ->
           _ = stop_broker(broker)
-          _ = delete(pod_name, settings)
+          _ = delete(pod_name, settings, wait: true)
           {:error, {:pod_start_failed, pod_name, reason}}
       end
     else
       {:error, reason} ->
         {:error, {:pod_start_failed, pod_name, reason}}
+    end
+  end
+
+  # `wait_ready` only proves that *a* pod with this name is Ready — not that this
+  # broker's `kubectl run -i` connection actually attached. When the connection
+  # dies early (classically because the name collided and kubectl exited with
+  # `AlreadyExists`, matching a leftover Ready pod owned by nobody), the broker
+  # process is already gone and every command would fail `{:no_broker_for_pod}`.
+  # Treat a dead broker as a failed start and tear the pod down synchronously so a
+  # retry does not inherit an orphan.
+  defp confirm_broker_started(broker, pod_name, settings, k8s) do
+    if Process.alive?(broker) do
+      Logger.info("Started symphony runner pod pod=#{pod_name} namespace=#{k8s.namespace}")
+      {:ok, broker}
+    else
+      _ = stop_broker(broker)
+      _ = delete(pod_name, settings, wait: true)
+      {:error, {:pod_start_failed, pod_name, :broker_connection_lost}}
     end
   end
 
@@ -122,13 +139,16 @@ defmodule SymphonyElixir.K8s.Pod do
 
   @doc """
   Deletes the pod. Never raises — a failed delete is logged so leaks are findable.
+
+  Pass `wait: true` to block until the pod is gone (bounded by a short timeout); teardown
+  after a failed `create/3` uses this so a leftover pod cannot linger and collide with a
+  retry. The default `wait: false` fires the delete and returns.
   """
-  @spec delete(String.t(), Schema.t() | map()) :: :ok
-  def delete(pod_name, settings) when is_binary(pod_name) do
+  @spec delete(String.t(), Schema.t() | map(), keyword()) :: :ok
+  def delete(pod_name, settings, opts \\ []) when is_binary(pod_name) do
     k8s = kubernetes(settings)
 
-    args =
-      base_args(k8s) ++ ["delete", "pod", pod_name, "--wait=false", "--ignore-not-found"]
+    args = base_args(k8s) ++ ["delete", "pod", pod_name, "--ignore-not-found"] ++ delete_wait_args(opts)
 
     case run_kubectl(args) do
       {_output, 0} ->
@@ -148,38 +168,115 @@ defmodule SymphonyElixir.K8s.Pod do
   end
 
   @doc """
-  Deletes all runner pods. Intended to run on orchestrator boot, when no runs are
-  active, to reclaim pods leaked by a prior crash that skipped normal teardown.
+  Reaps leaked runner pods so they do not accumulate.
+
+  With no options (the boot call) it bulk-deletes every runner pod: at boot no runs are
+  active, so any pod present was leaked by a prior crash that skipped teardown.
+
+  Called periodically mid-run it must not touch live pods, so pass:
+
+    * `keep:` — a set/list of pod names belonging to active runs, never deleted.
+    * `min_age_seconds:` — only reap pods at least this old, so a pod created between two
+      poll cycles (not yet reflected in `keep`) is not mistaken for an orphan.
   """
-  @spec reap_orphans(Schema.t() | map()) :: :ok
-  def reap_orphans(settings) do
+  @spec reap_orphans(Schema.t() | map(), keyword()) :: :ok
+  def reap_orphans(settings, opts \\ []) do
     k8s = kubernetes(settings)
 
     case ensure_configured(k8s) do
-      :ok ->
-        args =
-          base_args(k8s) ++
-            ["delete", "pods", "-l", "app=#{@runner_label}", "--ignore-not-found", "--wait=false"]
-
-        case run_kubectl(args) do
-          {_output, 0} ->
-            :ok
-
-          {output, status} ->
-            Logger.warning(
-              "Failed to reap orphan runner pods namespace=#{k8s.namespace} status=#{status} output=#{inspect(String.slice(output, 0, 512))}"
-            )
-
-            :ok
-        end
-
-      {:error, _reason} ->
-        :ok
+      :ok -> do_reap_orphans(k8s, opts)
+      {:error, _reason} -> :ok
     end
   rescue
     error ->
       Logger.warning("Error reaping orphan runner pods error=#{Exception.message(error)}")
       :ok
+  end
+
+  # Boot path: no active runs, so bulk-delete all runner pods in one call.
+  defp do_reap_orphans(k8s, []) do
+    args =
+      base_args(k8s) ++
+        ["delete", "pods", "-l", "app=#{@runner_label}", "--ignore-not-found", "--wait=false"]
+
+    case run_kubectl(args) do
+      {_output, 0} ->
+        :ok
+
+      {output, status} ->
+        Logger.warning(
+          "Failed to reap orphan runner pods namespace=#{k8s.namespace} status=#{status} output=#{inspect(String.slice(output, 0, 512))}"
+        )
+
+        :ok
+    end
+  end
+
+  # Mid-run path: delete only runner pods that no active run owns and that are old enough
+  # to not be a just-created pod racing the `keep` set.
+  defp do_reap_orphans(k8s, opts) do
+    keep = opts |> Keyword.get(:keep, []) |> Enum.into(MapSet.new())
+    min_age = Keyword.get(opts, :min_age_seconds, 0)
+
+    k8s
+    |> list_runner_pods()
+    |> Enum.filter(fn {name, age_seconds} ->
+      not MapSet.member?(keep, name) and age_seconds >= min_age
+    end)
+    |> Enum.each(fn {name, age_seconds} ->
+      Logger.info("Reaping orphan runner pod pod=#{name} namespace=#{k8s.namespace} age_seconds=#{age_seconds}")
+      delete(name, k8s)
+    end)
+
+    :ok
+  end
+
+  # Returns `[{pod_name, age_seconds}]` for every runner pod. On any failure returns `[]`
+  # so a reap cycle that cannot list simply does nothing.
+  defp list_runner_pods(k8s) do
+    args =
+      base_args(k8s) ++
+        [
+          "get",
+          "pods",
+          "-l",
+          "app=#{@runner_label}",
+          "-o",
+          "jsonpath=" <> pod_age_jsonpath()
+        ]
+
+    case run_kubectl(args) do
+      {output, 0} -> parse_pod_ages(output)
+      _ -> []
+    end
+  end
+
+  defp pod_age_jsonpath do
+    ~S({range .items[*]}{.metadata.name}{" "}{.metadata.creationTimestamp}{"\n"}{end})
+  end
+
+  @doc false
+  @spec parse_pod_ages(String.t(), integer()) :: [{String.t(), integer()}]
+  def parse_pod_ages(output, now_seconds \\ nil) do
+    now = now_seconds || System.os_time(:second)
+
+    output
+    |> String.split("\n", trim: true)
+    |> Enum.flat_map(fn line ->
+      case String.split(line, " ", trim: true) do
+        [name, timestamp] -> [{name, pod_age_seconds(timestamp, now)}]
+        _ -> []
+      end
+    end)
+  end
+
+  # Unparseable timestamps yield age 0 so an ambiguous pod is treated as "too young to
+  # reap" rather than risk deleting a live one.
+  defp pod_age_seconds(timestamp, now) do
+    case DateTime.from_iso8601(timestamp) do
+      {:ok, datetime, _offset} -> max(0, now - DateTime.to_unix(datetime))
+      _ -> 0
+    end
   end
 
   @doc false
@@ -361,6 +458,16 @@ defmodule SymphonyElixir.K8s.Pod do
 
   defp base_args(k8s) do
     K8s.context_args(k8s) ++ ["-n", k8s.namespace]
+  end
+
+  # `--wait=true` blocks until the object is gone; cap it so a stuck delete cannot hang a
+  # failed `create/3` indefinitely. `--now` drops the grace period to make it prompt.
+  defp delete_wait_args(opts) do
+    if Keyword.get(opts, :wait, false) do
+      ["--wait=true", "--now", "--timeout=30s"]
+    else
+      ["--wait=false"]
+    end
   end
 
   defp run_kubectl(args) do
