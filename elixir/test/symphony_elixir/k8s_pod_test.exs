@@ -143,7 +143,8 @@ defmodule SymphonyElixir.K8s.PodTest do
       assert "--rm" in args
       assert "-i" in args
       assert "--pod-running-timeout=90s" in args
-      assert "--container=runner" in args
+      # `kubectl run` has no `--container` flag; passing one aborts the launch.
+      refute Enum.any?(args, &String.starts_with?(&1, "--container"))
       assert List.last(args) == Protocol.reader_script()
       assert Enum.take(args, -3) == @reader_command
 
@@ -153,7 +154,7 @@ defmodule SymphonyElixir.K8s.PodTest do
       assert Jason.decode!(json) == manifest
     end
 
-    test "attaches to the configured container so kubectl does not default-and-warn" do
+    test "omits --container on multi-container pods since kubectl run rejects the flag" do
       k8s = %{
         namespace: "symphony",
         container: "runner",
@@ -173,7 +174,9 @@ defmodule SymphonyElixir.K8s.PodTest do
       manifest = Pod.build_manifest("symphony-eng-9-abcd", k8s)
       args = Pod.run_args(manifest, k8s)
 
-      assert "--container=runner" in args
+      # The `Defaulted container "..."` banner this would otherwise silence is dropped in
+      # the broker's stray-output path instead (see K8s.Broker.kubectl_attach_banner?/1).
+      refute Enum.any?(args, &String.starts_with?(&1, "--container"))
     end
   end
 end

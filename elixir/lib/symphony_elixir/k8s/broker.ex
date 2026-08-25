@@ -27,6 +27,12 @@ defmodule SymphonyElixir.K8s.Broker do
   @registry SymphonyElixir.K8s.BrokerRegistry
   @line_bytes 1_048_576
   @call_timeout :infinity
+  # How many recent stray-output lines to retain for diagnostics. `kubectl run` failures
+  # (bad flag, admission denial, forbidden) print a line or two to stderr before exiting,
+  # and that is the only place the real reason appears — the pod object never gets created,
+  # so `kubectl wait` only ever sees `NotFound`. Keep the last few so `create/3` and the
+  # connection-exit log can surface them instead of the misleading `NotFound`.
+  @recent_limit 20
 
   # --- Client ----------------------------------------------------------------------
 
@@ -75,6 +81,19 @@ defmodule SymphonyElixir.K8s.Broker do
     :exit, _reason -> nil
   end
 
+  @doc """
+  Returns the recent stray-output lines (oldest first) captured off the connection — the
+  `kubectl run` stderr that explains a failed start. Returns `[]` if the broker has already
+  died (a fast `kubectl run` failure races this), which is why the connection-exit path also
+  logs the same output; use this only as a best-effort enrichment.
+  """
+  @spec recent_output(pid()) :: [String.t()]
+  def recent_output(broker) when is_pid(broker) do
+    GenServer.call(broker, :recent_output, @call_timeout)
+  catch
+    :exit, _reason -> []
+  end
+
   # --- Server ----------------------------------------------------------------------
 
   @impl true
@@ -103,7 +122,9 @@ defmodule SymphonyElixir.K8s.Broker do
        buf: "",
        sync: nil,
        sync_queue: :queue.new(),
-       agent: nil
+       agent: nil,
+       # Recent stray-output lines, newest first (see `@recent_limit`).
+       recent: []
      }}
   rescue
     error -> {:stop, {:port_open_failed, Exception.message(error)}}
@@ -149,6 +170,10 @@ defmodule SymphonyElixir.K8s.Broker do
 
   def handle_call({:os_pid, _ref}, _from, state), do: {:reply, nil, state}
 
+  def handle_call(:recent_output, _from, state) do
+    {:reply, Enum.reverse(state.recent), state}
+  end
+
   @impl true
   def handle_info({port, {:data, {:eol, chunk}}}, %{port: port, buf: buf} = state) do
     {:noreply, process_line(buf <> chunk, %{state | buf: ""})}
@@ -159,6 +184,11 @@ defmodule SymphonyElixir.K8s.Broker do
   end
 
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
+    # A non-zero exit means `kubectl run` (or the pod) failed. The pod object is usually
+    # never created, so `create/3`'s `kubectl wait` only sees `NotFound`; log the captured
+    # stderr here at `warning` so the real cause survives even when the broker dies before
+    # `create/3` can query `recent_output/1`.
+    maybe_log_connection_failure(status, state)
     {:stop, :normal, fail_pending(state, {:connection_closed, status})}
   end
 
@@ -227,17 +257,34 @@ defmodule SymphonyElixir.K8s.Broker do
     trimmed = String.trim(line)
 
     cond do
-      trimmed == "" -> :ok
-      kubectl_attach_banner?(trimmed) -> :ok
-      true -> Logger.debug("Runner pod #{state.name} stray output: #{trimmed}")
-    end
+      trimmed == "" ->
+        state
 
-    state
+      kubectl_attach_banner?(trimmed) ->
+        state
+
+      true ->
+        Logger.debug("Runner pod #{state.name} stray output: #{trimmed}")
+        %{state | recent: Enum.take([trimmed | state.recent], @recent_limit)}
+    end
   end
 
-  # `kubectl run -i` prints this banner to stderr when it attaches interactively. There
-  # is no flag to suppress it, so drop it instead of logging it as stray pod output.
+  defp maybe_log_connection_failure(0, _state), do: :ok
+
+  defp maybe_log_connection_failure(_status, %{recent: []}), do: :ok
+
+  defp maybe_log_connection_failure(status, %{recent: recent, name: name}) do
+    output = recent |> Enum.reverse() |> Enum.join(" | ")
+    Logger.warning("Runner pod #{name} connection exited status=#{status} output=#{output}")
+  end
+
+  # `kubectl run -i` prints these banners to stderr when it attaches interactively. There
+  # is no flag to suppress them, so drop them instead of logging them as stray pod output.
+  #   * the interactive-attach hint, printed unconditionally.
+  #   * `Defaulted container "runner" out of: runner, dind` — on a multi-container pod
+  #     kubectl attaches to the first container and announces which one.
   defp kubectl_attach_banner?("If you don't see a command prompt, try pressing enter."), do: true
+  defp kubectl_attach_banner?("Defaulted container " <> _rest), do: true
   defp kubectl_attach_banner?(_line), do: false
 
   defp drain_queue(%{sync: nil, sync_queue: queue} = state) do

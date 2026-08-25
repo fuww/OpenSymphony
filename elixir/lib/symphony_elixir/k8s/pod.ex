@@ -71,9 +71,14 @@ defmodule SymphonyElixir.K8s.Pod do
           confirm_broker_started(broker, pod_name, settings, k8s)
 
         {:error, reason} ->
+          # `reason` is typically `{:wait_failed, _, "...NotFound..."}` because the pod
+          # object was never created. The real cause is the `kubectl run` stderr the broker
+          # captured; fold it in when still reachable. A fast `kubectl run` failure kills the
+          # broker before this runs, in which case the broker's connection-exit log carries it.
+          enriched = enrich_start_failure(reason, broker)
           _ = stop_broker(broker)
           _ = delete(pod_name, settings, wait: true)
-          {:error, {:pod_start_failed, pod_name, reason}}
+          {:error, {:pod_start_failed, pod_name, enriched}}
       end
     else
       {:error, reason} ->
@@ -307,11 +312,10 @@ defmodule SymphonyElixir.K8s.Pod do
         "--restart=Never",
         "--rm",
         "-i",
-        # Attach to the reader container explicitly. Without this, a multi-container pod
-        # (e.g. a `dind` sidecar) makes kubectl pick the first container and print a
-        # `Defaulted container "..." out of: ...` banner to stderr, which then shows up as
-        # stray output on the broker's connection.
-        "--container=#{target_container_name(manifest, k8s)}",
+        # NOTE: `kubectl run` has no `--container` flag (that's `exec`/`attach`/`logs`).
+        # A multi-container pod (e.g. a `dind` sidecar) makes kubectl attach to the first
+        # container and print a `Defaulted container "..." out of: ...` banner to stderr;
+        # that banner is dropped in the broker's stray-output path instead of here.
         "--pod-running-timeout=#{ready_timeout_seconds(k8s)}s",
         "--overrides=#{Jason.encode!(manifest)}",
         "--command",
@@ -405,15 +409,6 @@ defmodule SymphonyElixir.K8s.Pod do
     end
   end
 
-  defp target_container_name(manifest, k8s) do
-    containers = get_in(manifest, ["spec", "containers"]) || []
-
-    case Enum.at(containers, target_container_index(containers, k8s)) do
-      %{"name" => name} when is_binary(name) and name != "" -> name
-      _ -> @default_container_name
-    end
-  end
-
   # The container Symphony execs into / injects the keepalive command on: the one
   # named by `container` if configured, else the first.
   defp target_container_index(containers, %{container: name}) when is_binary(name) and name != "" do
@@ -424,6 +419,22 @@ defmodule SymphonyElixir.K8s.Pod do
   end
 
   defp target_container_index(_containers, _k8s), do: 0
+
+  # Best-effort: append the broker's captured `kubectl run` stderr to the failure reason so
+  # the caller sees the real cause instead of a bare `NotFound`. Returns `reason` unchanged
+  # when the broker is already gone or captured nothing.
+  defp enrich_start_failure(reason, broker) do
+    case broker_output(broker) do
+      [] -> reason
+      lines -> {reason, {:kubectl_output, lines}}
+    end
+  end
+
+  defp broker_output(broker) when is_pid(broker) do
+    if Process.alive?(broker), do: Broker.recent_output(broker), else: []
+  end
+
+  defp broker_output(_broker), do: []
 
   defp wait_ready(pod_name, k8s), do: wait_ready(pod_name, k8s, @wait_max_retries)
 
