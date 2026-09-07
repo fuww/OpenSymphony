@@ -723,6 +723,86 @@ defmodule SymphonyElixir.CoreTest do
     refute Process.alive?(agent_pid)
   end
 
+  test "reconcile releases an orphaned claim with no running task or pending retry" do
+    issue_id = "issue-orphan"
+
+    state = %Orchestrator.State{
+      running: %{},
+      claimed: MapSet.new([issue_id]),
+      agent_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    updated_state = Orchestrator.reconcile_orphaned_claims_for_test(state)
+
+    refute MapSet.member?(updated_state.claimed, issue_id)
+  end
+
+  test "reconcile keeps a claim backed by a running task" do
+    issue_id = "issue-running"
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: self(),
+          ref: nil,
+          identifier: "MT-570",
+          issue: %Issue{id: issue_id, identifier: "MT-570", state: "In Progress"},
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      agent_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    updated_state = Orchestrator.reconcile_orphaned_claims_for_test(state)
+
+    assert MapSet.member?(updated_state.claimed, issue_id)
+  end
+
+  test "reconcile keeps a claim backed by a pending retry" do
+    issue_id = "issue-retrying"
+
+    state = %Orchestrator.State{
+      running: %{},
+      claimed: MapSet.new([issue_id]),
+      agent_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{issue_id => %{attempt: 1}}
+    }
+
+    updated_state = Orchestrator.reconcile_orphaned_claims_for_test(state)
+
+    assert MapSet.member?(updated_state.claimed, issue_id)
+  end
+
+  test "reconcile releases only the orphaned claim in a mixed set" do
+    orphan_id = "issue-mixed-orphan"
+    running_id = "issue-mixed-running"
+    retrying_id = "issue-mixed-retrying"
+
+    state = %Orchestrator.State{
+      running: %{
+        running_id => %{
+          pid: self(),
+          ref: nil,
+          identifier: "MT-571",
+          issue: %Issue{id: running_id, identifier: "MT-571", state: "In Progress"},
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([orphan_id, running_id, retrying_id]),
+      agent_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{retrying_id => %{attempt: 2}}
+    }
+
+    updated_state = Orchestrator.reconcile_orphaned_claims_for_test(state)
+
+    refute MapSet.member?(updated_state.claimed, orphan_id)
+    assert MapSet.member?(updated_state.claimed, running_id)
+    assert MapSet.member?(updated_state.claimed, retrying_id)
+  end
+
   test "normal worker exit schedules active-state continuation retry" do
     issue_id = "issue-resume"
     ref = make_ref()

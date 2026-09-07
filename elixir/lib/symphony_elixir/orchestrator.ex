@@ -288,7 +288,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_dispatch(%State{} = state) do
-    state = reconcile_running_issues(state)
+    state =
+      state
+      |> reconcile_running_issues()
+      |> reconcile_orphaned_claims()
 
     with {:ok, issues} <- Tracker.fetch_candidate_issues(),
          true <- available_slots(state) > 0 do
@@ -326,6 +329,29 @@ defmodule SymphonyElixir.Orchestrator do
           state
       end
     end
+  end
+
+  defp reconcile_orphaned_claims(%State{} = state) do
+    orphaned =
+      Enum.reject(state.claimed, fn issue_id ->
+        Map.has_key?(state.running, issue_id) or Map.has_key?(state.retry_attempts, issue_id)
+      end)
+
+    if orphaned == [] do
+      state
+    else
+      Enum.reduce(orphaned, state, fn issue_id, state_acc ->
+        Logger.warning("Releasing orphaned claim with no running task or pending retry issue_id=#{issue_id}")
+
+        release_issue_claim(state_acc, issue_id)
+      end)
+    end
+  end
+
+  @doc false
+  @spec reconcile_orphaned_claims_for_test(term()) :: term()
+  def reconcile_orphaned_claims_for_test(%State{} = state) do
+    reconcile_orphaned_claims(state)
   end
 
   @doc false
