@@ -98,7 +98,11 @@ defmodule SymphonyElixir.Config.Schema do
       field(:project_slug, :string)
       field(:assignee, :string)
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
-      field(:terminal_states, {:array, :string}, default: ["Backlog", "Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
+
+      field(:terminal_states, {:array, :string},
+        default: ["Backlog", "Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+      )
+
       embeds_many(:projects, TrackerProject, on_replace: :delete)
     end
 
@@ -259,18 +263,19 @@ defmodule SymphonyElixir.Config.Schema do
       end
     end
 
+    @boolean_values %{
+      "true" => true,
+      "yes" => true,
+      "on" => true,
+      "1" => true,
+      "false" => false,
+      "no" => false,
+      "off" => false,
+      "0" => false
+    }
+
     defp normalize_boolean_value(value) when is_binary(value) do
-      case String.downcase(String.trim(value)) do
-        "true" -> true
-        "yes" -> true
-        "on" -> true
-        "1" -> true
-        "false" -> false
-        "no" -> false
-        "off" -> false
-        "0" -> false
-        _ -> value
-      end
+      Map.get(@boolean_values, String.downcase(String.trim(value)), value)
     end
 
     defp normalize_boolean_value(value), do: value
@@ -299,7 +304,14 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:backend, :default_effort, :max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
+        [
+          :backend,
+          :default_effort,
+          :max_concurrent_agents,
+          :max_turns,
+          :max_retry_backoff_ms,
+          :max_concurrent_agents_by_state
+        ],
         empty_values: []
       )
       |> update_change(:backend, &Schema.normalize_optional_string/1)
@@ -806,7 +818,9 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp finalize_settings(settings, raw_config, opts) do
     base_dir = Keyword.get(opts, :base_dir, File.cwd!())
-    resolved_workspace_root = resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"), base_dir)
+
+    resolved_workspace_root =
+      resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"), base_dir)
 
     tracker_projects =
       settings.tracker.projects
@@ -1214,7 +1228,9 @@ defmodule SymphonyElixir.Config.Schema do
           :ok
 
         unsupported_opencode_key ->
-          {:error, {:invalid_workflow_config, "`opencode.#{unsupported_opencode_key}` is no longer supported. OpenCode v1 uses `command`, `agent`, `model`, and timeout settings only."}}
+          {:error,
+           {:invalid_workflow_config,
+            "`opencode.#{unsupported_opencode_key}` is no longer supported. OpenCode v1 uses `command`, `agent`, `model`, and timeout settings only."}}
       end
     end
   end
@@ -1223,7 +1239,8 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp validate_global_only_config(config, :global) when is_map(config) do
     if Map.has_key?(config, "hooks") do
-      {:error, {:invalid_workflow_config, "`hooks` must be defined in repo-local WORKFLOW.md files when using symphony.yml"}}
+      {:error,
+       {:invalid_workflow_config, "`hooks` must be defined in repo-local WORKFLOW.md files when using symphony.yml"}}
     else
       :ok
     end
@@ -1260,7 +1277,9 @@ defmodule SymphonyElixir.Config.Schema do
         {:error, {:invalid_workflow_config, "OpenCode v1 is local-only. Remove `worker.ssh_hosts` from `WORKFLOW.md`."}}
 
       is_integer(settings.worker.max_concurrent_agents_per_host) ->
-        {:error, {:invalid_workflow_config, "OpenCode v1 is local-only. Remove `worker.max_concurrent_agents_per_host` from `WORKFLOW.md`."}}
+        {:error,
+         {:invalid_workflow_config,
+          "OpenCode v1 is local-only. Remove `worker.max_concurrent_agents_per_host` from `WORKFLOW.md`."}}
 
       true ->
         :ok

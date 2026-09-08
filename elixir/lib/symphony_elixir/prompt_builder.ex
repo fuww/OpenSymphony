@@ -30,15 +30,23 @@ defmodule SymphonyElixir.PromptBuilder do
         default_prompt(prompt_template)
 
       _ ->
-        if Config.global_mode?() do
-          case IssueConfig.resolve(issue) do
-            {:ok, %IssueConfig{prompt_template: prompt_template}} -> default_prompt(prompt_template)
-            {:error, reason} -> raise RuntimeError, "workflow_unavailable: #{inspect(reason)}"
-          end
-        else
-          Workflow.current()
-          |> prompt_template!()
-        end
+        resolve_prompt_template_without_config(issue)
+    end
+  end
+
+  defp resolve_prompt_template_without_config(issue) do
+    if Config.global_mode?() do
+      resolve_global_prompt_template(issue)
+    else
+      Workflow.current()
+      |> prompt_template!()
+    end
+  end
+
+  defp resolve_global_prompt_template(issue) do
+    case IssueConfig.resolve(issue) do
+      {:ok, %IssueConfig{prompt_template: prompt_template}} -> default_prompt(prompt_template)
+      {:error, reason} -> raise RuntimeError, "workflow_unavailable: #{inspect(reason)}"
     end
   end
 

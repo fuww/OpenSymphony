@@ -77,29 +77,36 @@ defmodule SymphonyElixir.CLI do
   @spec run(String.t(), keyword(), deps()) :: :ok | {:error, String.t()}
   def run(config_path, opts, deps) do
     expanded_path = Path.expand(config_path)
-    mode = startup_mode_for_path(expanded_path)
 
     if deps.file_regular?.(expanded_path) do
-      case mode do
-        :legacy ->
-          :ok = deps.set_workflow_file_path.(expanded_path)
-
-        :global ->
-          :ok = deps.set_symphony_config_file_path.(expanded_path)
-      end
-
-      with :ok <- maybe_set_logs_root(opts, deps),
-           :ok <- validate_config(expanded_path, deps) do
-        case deps.ensure_all_started.() do
-          {:ok, _started_apps} ->
-            :ok
-
-          {:error, reason} ->
-            {:error, "Failed to start Symphony with config #{expanded_path}: #{inspect(reason)}"}
-        end
-      end
+      apply_startup_mode(expanded_path, deps)
+      start_symphony(expanded_path, opts, deps)
     else
       {:error, "Config file not found: #{expanded_path}"}
+    end
+  end
+
+  defp apply_startup_mode(expanded_path, deps) do
+    case startup_mode_for_path(expanded_path) do
+      :legacy -> :ok = deps.set_workflow_file_path.(expanded_path)
+      :global -> :ok = deps.set_symphony_config_file_path.(expanded_path)
+    end
+  end
+
+  defp start_symphony(expanded_path, opts, deps) do
+    with :ok <- maybe_set_logs_root(opts, deps),
+         :ok <- validate_config(expanded_path, deps) do
+      ensure_all_started(expanded_path, deps)
+    end
+  end
+
+  defp ensure_all_started(expanded_path, deps) do
+    case deps.ensure_all_started.() do
+      {:ok, _started_apps} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, "Failed to start Symphony with config #{expanded_path}: #{inspect(reason)}"}
     end
   end
 
@@ -198,7 +205,10 @@ defmodule SymphonyElixir.CLI do
          :ok <- maybe_set_account_config_path(config_path, deps),
          {:ok, result} <- account_dep(deps, :accounts_verify).(backend, id, opts) do
       account = Map.get(result, :account) || %{}
-      IO.puts("Verified #{Map.get(account, :backend, backend)} account #{Map.get(account, :id, id)}#{email_suffix(account)}")
+
+      IO.puts(
+        "Verified #{Map.get(account, :backend, backend)} account #{Map.get(account, :id, id)}#{email_suffix(account)}"
+      )
 
       case Map.get(result, :output) do
         output when is_binary(output) and output != "" -> IO.puts(output)
@@ -331,42 +341,52 @@ defmodule SymphonyElixir.CLI do
   defp parse_account_list_args(_opts, _args), do: {:error, %OptionParser.ParseError{message: usage_message()}}
 
   defp resolve_account_login_token_opts(opts) do
-    token_sources =
-      [
-        Keyword.has_key?(opts, :token),
-        Keyword.get(opts, :token_stdin, false),
-        Keyword.has_key?(opts, :token_file),
-        Keyword.has_key?(opts, :token_env)
-      ]
-      |> Enum.count(& &1)
-
     cond do
-      token_sources > 1 ->
-        {:error, %OptionParser.ParseError{message: "Pass only one of --token, --token-stdin, --token-file, or --token-env"}}
+      token_source_count(opts) > 1 ->
+        {:error,
+         %OptionParser.ParseError{message: "Pass only one of --token, --token-stdin, --token-file, or --token-env"}}
 
       Keyword.get(opts, :token_stdin, false) ->
         {:ok, opts |> Keyword.delete(:token_stdin) |> Keyword.put(:token, stdin_token())}
 
       token_file = Keyword.get(opts, :token_file) ->
-        case File.read(Path.expand(token_file)) do
-          {:ok, token} ->
-            {:ok, opts |> Keyword.delete(:token_file) |> Keyword.put(:token, String.trim(token))}
-
-          {:error, reason} ->
-            {:error, "Unable to read token file #{Path.expand(token_file)}: #{:file.format_error(reason)}"}
-        end
+        resolve_token_file_opts(opts, token_file)
 
       token_env = Keyword.get(opts, :token_env) ->
-        case System.get_env(token_env) do
-          token when is_binary(token) and token != "" ->
-            {:ok, opts |> Keyword.delete(:token_env) |> Keyword.put(:token, String.trim(token))}
-
-          _ ->
-            {:error, "Environment variable #{token_env} is not set or is empty"}
-        end
+        resolve_token_env_opts(opts, token_env)
 
       true ->
         {:ok, opts}
+    end
+  end
+
+  defp token_source_count(opts) do
+    [
+      Keyword.has_key?(opts, :token),
+      Keyword.get(opts, :token_stdin, false),
+      Keyword.has_key?(opts, :token_file),
+      Keyword.has_key?(opts, :token_env)
+    ]
+    |> Enum.count(& &1)
+  end
+
+  defp resolve_token_file_opts(opts, token_file) do
+    case File.read(Path.expand(token_file)) do
+      {:ok, token} ->
+        {:ok, opts |> Keyword.delete(:token_file) |> Keyword.put(:token, String.trim(token))}
+
+      {:error, reason} ->
+        {:error, "Unable to read token file #{Path.expand(token_file)}: #{:file.format_error(reason)}"}
+    end
+  end
+
+  defp resolve_token_env_opts(opts, token_env) do
+    case System.get_env(token_env) do
+      token when is_binary(token) and token != "" ->
+        {:ok, opts |> Keyword.delete(:token_env) |> Keyword.put(:token, String.trim(token))}
+
+      _ ->
+        {:error, "Environment variable #{token_env} is not set or is empty"}
     end
   end
 
@@ -382,7 +402,8 @@ defmodule SymphonyElixir.CLI do
 
     cond do
       is_binary(config_opt) and is_binary(trailing_path) ->
-        {:error, %OptionParser.ParseError{message: "Pass account config path either as --config or trailing path, not both"}}
+        {:error,
+         %OptionParser.ParseError{message: "Pass account config path either as --config or trailing path, not both"}}
 
       is_binary(config_opt) ->
         {:ok, config_opt}

@@ -14,10 +14,10 @@ defmodule SymphonyElixir.TestSupport do
       alias SymphonyElixir.Linear.Client
       alias SymphonyElixir.Linear.Issue
       alias SymphonyElixir.Orchestrator
-      alias SymphonyElixir.PromptBuilder
       alias SymphonyElixir.ProjectWorkflow
-      alias SymphonyElixir.SymphonyConfig
+      alias SymphonyElixir.PromptBuilder
       alias SymphonyElixir.StatusDashboard
+      alias SymphonyElixir.SymphonyConfig
       alias SymphonyElixir.Tracker
       alias SymphonyElixir.Workflow
       alias SymphonyElixir.WorkflowStore
@@ -357,23 +357,23 @@ defmodule SymphonyElixir.TestSupport do
         "  stall_timeout_ms: #{yaml_value(claude_stall_timeout_ms)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
-        telemetry_yaml(
-          telemetry_enabled,
-          telemetry_otlp_endpoint,
-          telemetry_otlp_protocol,
-          telemetry_otlp_traces_endpoint,
-          telemetry_otlp_traces_protocol,
-          telemetry_otlp_logs_endpoint,
-          telemetry_otlp_logs_protocol,
-          telemetry_otlp_metrics_endpoint,
-          telemetry_otlp_metrics_protocol,
-          telemetry_include_traces,
-          telemetry_include_metrics,
-          telemetry_include_logs,
-          telemetry_log_user_prompts,
-          telemetry_log_tool_details,
-          telemetry_resource_attributes
-        ),
+        telemetry_yaml(%{
+          enabled: telemetry_enabled,
+          endpoint: telemetry_otlp_endpoint,
+          protocol: telemetry_otlp_protocol,
+          traces_endpoint: telemetry_otlp_traces_endpoint,
+          traces_protocol: telemetry_otlp_traces_protocol,
+          logs_endpoint: telemetry_otlp_logs_endpoint,
+          logs_protocol: telemetry_otlp_logs_protocol,
+          metrics_endpoint: telemetry_otlp_metrics_endpoint,
+          metrics_protocol: telemetry_otlp_metrics_protocol,
+          traces: telemetry_include_traces,
+          metrics: telemetry_include_metrics,
+          logs: telemetry_include_logs,
+          log_user_prompts: telemetry_log_user_prompts,
+          log_tool_details: telemetry_log_tool_details,
+          attrs: telemetry_resource_attributes
+        }),
         server_yaml(server_port, server_host),
         instance_yaml(instance_name),
         "---",
@@ -566,20 +566,9 @@ defmodule SymphonyElixir.TestSupport do
     instance_name = Keyword.get(config, :instance_name)
 
     projects =
-      Keyword.get(config, :projects)
-      |> Enum.map(fn project ->
-        project
-        |> Map.new()
-        |> Map.update("workflow", nil, fn workflow ->
-          if is_binary(workflow) and workflow not in ["", nil] and
-               Path.type(workflow) != :absolute and
-               not String.starts_with?(workflow, ["./", "../", "~/"]) do
-            "./" <> workflow
-          else
-            workflow
-          end
-        end)
-      end)
+      config
+      |> Keyword.get(:projects)
+      |> Enum.map(&normalize_project/1)
 
     sections =
       [
@@ -635,23 +624,23 @@ defmodule SymphonyElixir.TestSupport do
         "  read_timeout_ms: #{yaml_value(claude_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(claude_stall_timeout_ms)}",
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
-        telemetry_yaml(
-          telemetry_enabled,
-          telemetry_otlp_endpoint,
-          telemetry_otlp_protocol,
-          telemetry_otlp_traces_endpoint,
-          telemetry_otlp_traces_protocol,
-          telemetry_otlp_logs_endpoint,
-          telemetry_otlp_logs_protocol,
-          telemetry_otlp_metrics_endpoint,
-          telemetry_otlp_metrics_protocol,
-          telemetry_include_traces,
-          telemetry_include_metrics,
-          telemetry_include_logs,
-          telemetry_log_user_prompts,
-          telemetry_log_tool_details,
-          telemetry_resource_attributes
-        ),
+        telemetry_yaml(%{
+          enabled: telemetry_enabled,
+          endpoint: telemetry_otlp_endpoint,
+          protocol: telemetry_otlp_protocol,
+          traces_endpoint: telemetry_otlp_traces_endpoint,
+          traces_protocol: telemetry_otlp_traces_protocol,
+          logs_endpoint: telemetry_otlp_logs_endpoint,
+          logs_protocol: telemetry_otlp_logs_protocol,
+          metrics_endpoint: telemetry_otlp_metrics_endpoint,
+          metrics_protocol: telemetry_otlp_metrics_protocol,
+          traces: telemetry_include_traces,
+          metrics: telemetry_include_metrics,
+          logs: telemetry_include_logs,
+          log_user_prompts: telemetry_log_user_prompts,
+          log_tool_details: telemetry_log_tool_details,
+          attrs: telemetry_resource_attributes
+        }),
         server_yaml(server_port, server_host),
         instance_yaml(instance_name),
         "projects: #{yaml_value(projects)}"
@@ -660,6 +649,24 @@ defmodule SymphonyElixir.TestSupport do
 
     Enum.join(sections, "\n") <> "\n"
   end
+
+  defp normalize_project(project) do
+    project
+    |> Map.new()
+    |> Map.update("workflow", nil, &normalize_project_workflow/1)
+  end
+
+  defp normalize_project_workflow(workflow)
+       when is_binary(workflow) and workflow != "" do
+    if Path.type(workflow) != :absolute and
+         not String.starts_with?(workflow, ["./", "../", "~/"]) do
+      "./" <> workflow
+    else
+      workflow
+    end
+  end
+
+  defp normalize_project_workflow(workflow), do: workflow
 
   defp yaml_value(value) when is_binary(value) do
     "\"" <> String.replace(value, "\"", "\\\"") <> "\""
@@ -782,59 +789,26 @@ defmodule SymphonyElixir.TestSupport do
     |> Enum.join("\n")
   end
 
-  defp telemetry_yaml(
-         false,
-         _endpoint,
-         _protocol,
-         _traces_endpoint,
-         _traces_protocol,
-         _logs_endpoint,
-         _logs_protocol,
-         _metrics_endpoint,
-         _metrics_protocol,
-         _traces,
-         _metrics,
-         _logs,
-         _log_user_prompts,
-         _log_tool_details,
-         _attrs
-       ),
-       do: nil
+  defp telemetry_yaml(%{enabled: false}), do: nil
 
-  defp telemetry_yaml(
-         true,
-         endpoint,
-         protocol,
-         traces_endpoint,
-         traces_protocol,
-         logs_endpoint,
-         logs_protocol,
-         metrics_endpoint,
-         metrics_protocol,
-         traces,
-         metrics,
-         logs,
-         log_user_prompts,
-         log_tool_details,
-         attrs
-       ) do
+  defp telemetry_yaml(%{enabled: true} = opts) do
     [
       "telemetry:",
       "  enabled: true",
-      "  otlp_endpoint: #{yaml_value(endpoint)}",
-      "  otlp_protocol: #{yaml_value(protocol)}",
-      "  otlp_traces_endpoint: #{yaml_value(traces_endpoint)}",
-      "  otlp_traces_protocol: #{yaml_value(traces_protocol)}",
-      "  otlp_logs_endpoint: #{yaml_value(logs_endpoint)}",
-      "  otlp_logs_protocol: #{yaml_value(logs_protocol)}",
-      "  otlp_metrics_endpoint: #{yaml_value(metrics_endpoint)}",
-      "  otlp_metrics_protocol: #{yaml_value(metrics_protocol)}",
-      "  include_traces: #{yaml_value(traces)}",
-      "  include_metrics: #{yaml_value(metrics)}",
-      "  include_logs: #{yaml_value(logs)}",
-      "  log_user_prompts: #{yaml_value(log_user_prompts)}",
-      "  log_tool_details: #{yaml_value(log_tool_details)}",
-      telemetry_resource_attributes_yaml(attrs)
+      "  otlp_endpoint: #{yaml_value(opts.endpoint)}",
+      "  otlp_protocol: #{yaml_value(opts.protocol)}",
+      "  otlp_traces_endpoint: #{yaml_value(opts.traces_endpoint)}",
+      "  otlp_traces_protocol: #{yaml_value(opts.traces_protocol)}",
+      "  otlp_logs_endpoint: #{yaml_value(opts.logs_endpoint)}",
+      "  otlp_logs_protocol: #{yaml_value(opts.logs_protocol)}",
+      "  otlp_metrics_endpoint: #{yaml_value(opts.metrics_endpoint)}",
+      "  otlp_metrics_protocol: #{yaml_value(opts.metrics_protocol)}",
+      "  include_traces: #{yaml_value(opts.traces)}",
+      "  include_metrics: #{yaml_value(opts.metrics)}",
+      "  include_logs: #{yaml_value(opts.logs)}",
+      "  log_user_prompts: #{yaml_value(opts.log_user_prompts)}",
+      "  log_tool_details: #{yaml_value(opts.log_tool_details)}",
+      telemetry_resource_attributes_yaml(opts.attrs)
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join("\n")
@@ -845,9 +819,9 @@ defmodule SymphonyElixir.TestSupport do
 
   defp telemetry_resource_attributes_yaml(attrs) do
     lines =
-      attrs
-      |> Enum.map(fn {key, value} -> "    #{yaml_value(to_string(key))}: #{yaml_value(to_string(value))}" end)
-      |> Enum.join("\n")
+      Enum.map_join(attrs, "\n", fn {key, value} ->
+        "    #{yaml_value(to_string(key))}: #{yaml_value(to_string(value))}"
+      end)
 
     "  resource_attributes:\n" <> lines
   end

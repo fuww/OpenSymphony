@@ -127,7 +127,9 @@ defmodule SymphonyElixir.Codex.AppServer do
                }}
 
             {:error, reason} ->
-              Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
+              Logger.warning(
+                "Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}"
+              )
 
               emit_message(
                 on_message,
@@ -371,9 +373,9 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp remote_environment_exports(issue, account) do
-    env_pairs(issue, account)
-    |> Enum.map(fn {key, value} -> "export #{key}=#{shell_escape(to_string(value))}" end)
-    |> Enum.join(" && ")
+    Enum.map_join(env_pairs(issue, account), " && ", fn {key, value} ->
+      "export #{key}=#{shell_escape(to_string(value))}"
+    end)
   end
 
   defp port_environment(issue, account) do

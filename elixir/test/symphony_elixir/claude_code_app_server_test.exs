@@ -228,7 +228,8 @@ defmodule SymphonyElixir.ClaudeCodeAppServerTest do
       assert payload["message"] == "blocked"
       assert_receive {:agent_message, %{event: :turn_started}}, 1_000
 
-      assert_receive {:agent_message, %{event: :turn_ended_with_error, reason: {:claude_result_error, %{"subtype" => "error"}}}},
+      assert_receive {:agent_message,
+                      %{event: :turn_ended_with_error, reason: {:claude_result_error, %{"subtype" => "error"}}}},
                      1_000
     after
       File.rm_rf(test_root)

@@ -144,7 +144,9 @@ defmodule SymphonyElixir.Orchestrator do
         state =
           case reason do
             :normal ->
-              Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+              Logger.info(
+                "Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check"
+              )
 
               state
               |> complete_issue(issue_id)
@@ -161,7 +163,9 @@ defmodule SymphonyElixir.Orchestrator do
               )
 
             _ ->
-              Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
+              Logger.warning(
+                "Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry"
+              )
 
               next_attempt = next_retry_attempt_from_running(running_entry)
 
@@ -369,12 +373,16 @@ defmodule SymphonyElixir.Orchestrator do
   defp reconcile_issue_state(%Issue{} = issue, state, active_states, terminal_states) do
     cond do
       terminal_issue_state?(issue.state, terminal_states) ->
-        Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
+        Logger.info(
+          "Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent"
+        )
 
         terminate_running_issue(state, issue.id, true)
 
       !issue_routable_to_worker?(issue) ->
-        Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
+        Logger.info(
+          "Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent"
+        )
 
         terminate_running_issue(state, issue.id, false)
 
@@ -382,7 +390,9 @@ defmodule SymphonyElixir.Orchestrator do
         refresh_running_issue_state(state, issue)
 
       true ->
-        Logger.info("Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
+        Logger.info(
+          "Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; stopping active agent"
+        )
 
         terminate_running_issue(state, issue.id, false)
     end
@@ -415,7 +425,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp log_missing_running_issue(%State{} = state, issue_id) when is_binary(issue_id) do
     case Map.get(state.running, issue_id) do
       %{identifier: identifier} ->
-        Logger.info("Issue no longer visible during running-state refresh: issue_id=#{issue_id} issue_identifier=#{identifier}; stopping active agent")
+        Logger.info(
+          "Issue no longer visible during running-state refresh: issue_id=#{issue_id} issue_identifier=#{identifier}; stopping active agent"
+        )
 
       _ ->
         Logger.info("Issue no longer visible during running-state refresh: issue_id=#{issue_id}; stopping active agent")
@@ -474,14 +486,18 @@ defmodule SymphonyElixir.Orchestrator do
       now = DateTime.utc_now()
 
       Enum.reduce(state.running, state, fn {issue_id, running_entry}, state_acc ->
-        case running_entry_stall_timeout_ms(running_entry) do
-          timeout_ms when is_integer(timeout_ms) and timeout_ms > 0 ->
-            restart_stalled_issue(state_acc, issue_id, running_entry, now, timeout_ms)
-
-          _ ->
-            state_acc
-        end
+        maybe_restart_stalled_issue(state_acc, issue_id, running_entry, now)
       end)
+    end
+  end
+
+  defp maybe_restart_stalled_issue(state_acc, issue_id, running_entry, now) do
+    case running_entry_stall_timeout_ms(running_entry) do
+      timeout_ms when is_integer(timeout_ms) and timeout_ms > 0 ->
+        restart_stalled_issue(state_acc, issue_id, running_entry, now, timeout_ms)
+
+      _ ->
+        state_acc
     end
   end
 
@@ -492,7 +508,9 @@ defmodule SymphonyElixir.Orchestrator do
       identifier = Map.get(running_entry, :identifier, issue_id)
       session_id = running_entry_session_id(running_entry)
 
-      Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
+      Logger.warning(
+        "Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff"
+      )
 
       next_attempt = next_retry_attempt_from_running(running_entry)
 
@@ -559,19 +577,24 @@ defmodule SymphonyElixir.Orchestrator do
     issues
     |> sort_issues_for_dispatch()
     |> Enum.reduce_while(state, fn issue, state_acc ->
-      if available_slots(state_acc) <= 0 do
-        {:halt, state_acc}
-      else
-        state_acc =
-          if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
-            dispatch_issue(state_acc, issue)
-          else
-            state_acc
-          end
-
-        {:cont, state_acc}
-      end
+      maybe_dispatch_candidate(issue, state_acc, active_states, terminal_states)
     end)
+  end
+
+  defp maybe_dispatch_candidate(issue, state_acc, active_states, terminal_states) do
+    if available_slots(state_acc) <= 0 do
+      {:halt, state_acc}
+    else
+      {:cont, dispatch_candidate_if_eligible(issue, state_acc, active_states, terminal_states)}
+    end
+  end
+
+  defp dispatch_candidate_if_eligible(issue, state_acc, active_states, terminal_states) do
+    if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
+      dispatch_issue(state_acc, issue)
+    else
+      state_acc
+    end
   end
 
   defp sort_issues_for_dispatch(issues) when is_list(issues) do
@@ -723,7 +746,9 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       {:skip, %Issue{} = refreshed_issue} ->
-        Logger.info("Skipping stale dispatch after issue refresh: #{issue_context(refreshed_issue)} state=#{inspect(refreshed_issue.state)} blocked_by=#{length(refreshed_issue.blocked_by)}")
+        Logger.info(
+          "Skipping stale dispatch after issue refresh: #{issue_context(refreshed_issue)} state=#{inspect(refreshed_issue.state)} blocked_by=#{length(refreshed_issue.blocked_by)}"
+        )
 
         state
 
@@ -734,45 +759,70 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
-    recipient = self()
-
     case resolve_issue_dispatch(issue) do
       {:ok, issue_config, route} ->
-        Enum.each(route.warnings, fn warning ->
-          Logger.warning("Issue route warning for #{issue_context(issue)}: #{warning}")
-        end)
-
-        case select_worker_host(state, preferred_worker_host, route.backend) do
-          :no_worker_capacity ->
-            Logger.debug("No worker slots available for #{issue_context(issue)} backend=#{route.backend} preferred_worker_host=#{inspect(preferred_worker_host)}")
-
-            state
-
-          worker_host ->
-            case select_account_for_dispatch(route.backend, worker_host, state, issue_config.settings) do
-              {:ok, account} ->
-                spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, route, issue_config, account)
-
-              {:error, selection_error} ->
-                Logger.warning("No usable account for #{issue_context(issue)} backend=#{route.backend}: #{format_account_selection_error(selection_error)}")
-
-                state
-                |> schedule_issue_retry(
-                  issue.id,
-                  next_retry_attempt_from_attempt(attempt),
-                  account_retry_metadata(issue, worker_host, selection_error)
-                )
-                |> claim_issue(issue.id)
-            end
-        end
+        log_route_warnings(issue, route)
+        dispatch_to_worker_host(state, issue, attempt, preferred_worker_host, route, issue_config)
 
       {:error, reason} ->
-        Logger.error("Skipping dispatch; issue config resolution failed for #{issue_context(issue)}: #{inspect(reason)}")
+        Logger.error(
+          "Skipping dispatch; issue config resolution failed for #{issue_context(issue)}: #{inspect(reason)}"
+        )
+
         state
     end
   end
 
-  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, route, issue_config, account) do
+  defp log_route_warnings(issue, route) do
+    Enum.each(route.warnings, fn warning ->
+      Logger.warning("Issue route warning for #{issue_context(issue)}: #{warning}")
+    end)
+  end
+
+  defp dispatch_to_worker_host(%State{} = state, issue, attempt, preferred_worker_host, route, issue_config) do
+    case select_worker_host(state, preferred_worker_host, route.backend) do
+      :no_worker_capacity ->
+        Logger.debug(
+          "No worker slots available for #{issue_context(issue)} backend=#{route.backend} preferred_worker_host=#{inspect(preferred_worker_host)}"
+        )
+
+        state
+
+      worker_host ->
+        dispatch_with_account(state, issue, attempt, worker_host, route, issue_config)
+    end
+  end
+
+  defp dispatch_with_account(%State{} = state, issue, attempt, worker_host, route, issue_config) do
+    case select_account_for_dispatch(route.backend, worker_host, state, issue_config.settings) do
+      {:ok, account} ->
+        spawn_issue_on_worker_host(state, issue, attempt, self(), worker_host, route, issue_config, account)
+
+      {:error, selection_error} ->
+        Logger.warning(
+          "No usable account for #{issue_context(issue)} backend=#{route.backend}: #{format_account_selection_error(selection_error)}"
+        )
+
+        state
+        |> schedule_issue_retry(
+          issue.id,
+          next_retry_attempt_from_attempt(attempt),
+          account_retry_metadata(issue, worker_host, selection_error)
+        )
+        |> claim_issue(issue.id)
+    end
+  end
+
+  defp spawn_issue_on_worker_host(
+         %State{} = state,
+         issue,
+         attempt,
+         recipient,
+         worker_host,
+         route,
+         issue_config,
+         account
+       ) do
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
            AgentRunner.run(
              issue,
@@ -936,7 +986,9 @@ defmodule SymphonyElixir.Orchestrator do
 
     error_suffix = if is_binary(error), do: " error=#{error}", else: ""
 
-    Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt})#{error_suffix}")
+    Logger.warning(
+      "Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt})#{error_suffix}"
+    )
 
     %{
       state
@@ -995,7 +1047,9 @@ defmodule SymphonyElixir.Orchestrator do
         |> handle_retry_issue_lookup(state, issue_id, attempt, metadata)
 
       {:error, reason} ->
-        Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
+        Logger.warning(
+          "Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}"
+        )
 
         {:noreply,
          schedule_issue_retry(
@@ -1012,7 +1066,9 @@ defmodule SymphonyElixir.Orchestrator do
 
     cond do
       terminal_issue_state?(issue.state, terminal_states) ->
-        Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
+        Logger.info(
+          "Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace"
+        )
 
         cleanup_issue_workspace(issue, metadata[:worker_host])
         {:noreply, release_issue_claim(state, issue_id)}
@@ -1021,7 +1077,9 @@ defmodule SymphonyElixir.Orchestrator do
         handle_active_retry(state, issue, attempt, metadata)
 
       true ->
-        Logger.debug("Issue left active states, removing claim issue_id=#{issue_id} issue_identifier=#{issue.identifier}")
+        Logger.debug(
+          "Issue left active states, removing claim issue_id=#{issue_id} issue_identifier=#{issue.identifier}"
+        )
 
         {:noreply, release_issue_claim(state, issue_id)}
     end
@@ -1051,7 +1109,9 @@ defmodule SymphonyElixir.Orchestrator do
         end)
 
       {:error, reason} ->
-        Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
+        Logger.warning(
+          "Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}"
+        )
     end
   end
 
@@ -1083,7 +1143,10 @@ defmodule SymphonyElixir.Orchestrator do
         end
 
       {:error, reason} ->
-        Logger.error("Skipping retry dispatch; issue config resolution failed for #{issue_context(issue)}: #{inspect(reason)}")
+        Logger.error(
+          "Skipping retry dispatch; issue config resolution failed for #{issue_context(issue)}: #{inspect(reason)}"
+        )
+
         {:noreply, release_issue_claim(state, issue.id)}
     end
   end
@@ -1185,28 +1248,29 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp format_account_selection_error(%{backend: backend, reason: reason} = selection_error) do
-    next_reset =
-      case Map.get(selection_error, :next_available_at) do
-        reset when is_binary(reset) and reset != "" -> "; next reset at #{reset}"
-        _ -> ""
-      end
+    next_reset = next_reset_suffix(Map.get(selection_error, :next_available_at))
 
     skipped =
       selection_error
       |> Map.get(:skipped, [])
-      |> Enum.map_join("; ", fn skipped ->
-        account_id = Map.get(skipped, :account_id) || Map.get(skipped, "account_id") || "unknown"
-        email = Map.get(skipped, :email) || Map.get(skipped, "email")
-        label = if is_binary(email) and email != "", do: "#{account_id}(#{email})", else: account_id
-        skipped_reason = Map.get(skipped, :reason) || Map.get(skipped, "reason") || "unavailable"
-        "#{label}: #{skipped_reason}"
-      end)
+      |> Enum.map_join("; ", &format_skipped_account/1)
 
     skipped_suffix = if skipped == "", do: "", else: "; skipped #{skipped}"
     "#{reason || "no usable #{backend} accounts"}#{next_reset}#{skipped_suffix}"
   end
 
   defp format_account_selection_error(reason), do: inspect(reason)
+
+  defp next_reset_suffix(reset) when is_binary(reset) and reset != "", do: "; next reset at #{reset}"
+  defp next_reset_suffix(_reset), do: ""
+
+  defp format_skipped_account(skipped) do
+    account_id = Map.get(skipped, :account_id) || Map.get(skipped, "account_id") || "unknown"
+    email = Map.get(skipped, :email) || Map.get(skipped, "email")
+    label = if is_binary(email) and email != "", do: "#{account_id}(#{email})", else: account_id
+    skipped_reason = Map.get(skipped, :reason) || Map.get(skipped, "reason") || "unavailable"
+    "#{label}: #{skipped_reason}"
+  end
 
   defp account_retry_delay_ms(%{next_available_at: next_available_at}) when is_binary(next_available_at) do
     case DateTime.from_iso8601(next_available_at) do
@@ -1230,24 +1294,24 @@ defmodule SymphonyElixir.Orchestrator do
     if AgentRoute.local_only_backend?(backend || Config.agent_backend()) do
       nil
     else
-      case Config.settings!().worker.ssh_hosts do
-        [] ->
-          nil
+      select_worker_host_from_ssh_hosts(state, preferred_worker_host, Config.settings!().worker.ssh_hosts)
+    end
+  end
 
-        hosts ->
-          available_hosts = Enum.filter(hosts, &worker_host_slots_available?(state, &1))
+  defp select_worker_host_from_ssh_hosts(_state, _preferred_worker_host, []), do: nil
 
-          cond do
-            available_hosts == [] ->
-              :no_worker_capacity
+  defp select_worker_host_from_ssh_hosts(%State{} = state, preferred_worker_host, hosts) when is_list(hosts) do
+    available_hosts = Enum.filter(hosts, &worker_host_slots_available?(state, &1))
 
-            preferred_worker_host_available?(preferred_worker_host, available_hosts) ->
-              preferred_worker_host
+    cond do
+      available_hosts == [] ->
+        :no_worker_capacity
 
-            true ->
-              least_loaded_worker_host(state, available_hosts)
-          end
-      end
+      preferred_worker_host_available?(preferred_worker_host, available_hosts) ->
+        preferred_worker_host
+
+      true ->
+        least_loaded_worker_host(state, available_hosts)
     end
   end
 
@@ -2171,21 +2235,28 @@ defmodule SymphonyElixir.Orchestrator do
   defp turn_completed_codex_usage_from_payload(_payload), do: nil
 
   defp turn_completed_agent_usage_from_payload(payload) when is_map(payload) do
-    method = Map.get(payload, "method") || Map.get(payload, :method)
-
-    if method in ["turn/completed", :turn_completed] or
-         (Map.get(payload, "event") || Map.get(payload, :event)) in [:turn_completed, "turn_completed"] do
-      direct =
-        Map.get(payload, "usage") ||
-          Map.get(payload, :usage) ||
-          map_at_path(payload, ["params", "usage"]) ||
-          map_at_path(payload, [:params, :usage])
+    if turn_completed_agent_payload?(payload) do
+      direct = direct_usage_from_payload(payload)
 
       if is_map(direct) and agent_integer_token_map?(direct), do: direct
     end
   end
 
   defp turn_completed_agent_usage_from_payload(_payload), do: nil
+
+  defp turn_completed_agent_payload?(payload) do
+    method = Map.get(payload, "method") || Map.get(payload, :method)
+    event = Map.get(payload, "event") || Map.get(payload, :event)
+
+    method in ["turn/completed", :turn_completed] or event in [:turn_completed, "turn_completed"]
+  end
+
+  defp direct_usage_from_payload(payload) do
+    Map.get(payload, "usage") ||
+      Map.get(payload, :usage) ||
+      map_at_path(payload, ["params", "usage"]) ||
+      map_at_path(payload, [:params, :usage])
+  end
 
   defp rate_limits_from_payload(payload) when is_map(payload) do
     direct = Map.get(payload, "rate_limits") || Map.get(payload, :rate_limits)

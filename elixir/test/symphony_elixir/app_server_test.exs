@@ -162,104 +162,114 @@ defmodule SymphonyElixir.AppServerTest do
           1_000
         )
 
-      case FakeOpenCodeState.scenario(state) do
-        {:success, _workspace} ->
-          broadcast_success_events(state, session_id)
+      handle_scenario(FakeOpenCodeState.scenario(state), conn, state, session_id)
+    end
 
-          json(conn, 200, %{
-            "id" => "assistant-message-1",
-            "info" => %{
-              "id" => "assistant-message-1",
-              "sessionID" => session_id,
-              "tokens" => %{"input" => 12, "output" => 4, "reasoning" => 3}
-            }
-          })
+    defp handle_scenario({:success, _workspace}, conn, state, session_id) do
+      broadcast_success_events(state, session_id)
 
-        {:permission_within_workspace, workspace} ->
-          FakeOpenCodeState.broadcast(state, "permission.asked", %{
-            "id" => "perm-1",
+      json(conn, 200, %{
+        "id" => "assistant-message-1",
+        "info" => %{
+          "id" => "assistant-message-1",
+          "sessionID" => session_id,
+          "tokens" => %{"input" => 12, "output" => 4, "reasoning" => 3}
+        }
+      })
+    end
+
+    defp handle_scenario({:permission_within_workspace, workspace}, conn, state, session_id) do
+      FakeOpenCodeState.broadcast(state, "permission.asked", %{
+        "id" => "perm-1",
+        "sessionID" => session_id,
+        "permission" => "read",
+        "patterns" => [Path.join(workspace, "README.md")]
+      })
+
+      :ok = wait_for_permission_reply(state, session_id, "perm-1", "once")
+
+      json(conn, 200, %{
+        "info" => %{
+          "id" => "assistant-message-2",
+          "sessionID" => session_id,
+          "tokens" => %{"input" => 2, "output" => 1, "reasoning" => 0}
+        }
+      })
+    end
+
+    defp handle_scenario(:external_directory_permission, conn, state, session_id) do
+      FakeOpenCodeState.broadcast(state, "permission.asked", %{
+        "id" => "perm-2",
+        "sessionID" => session_id,
+        "permission" => "external_directory",
+        "patterns" => ["/tmp/external"]
+      })
+
+      :ok = wait_for_permission_reply(state, session_id, "perm-2", "reject")
+
+      json(conn, 200, %{
+        "info" => %{
+          "id" => "assistant-message-3",
+          "sessionID" => session_id,
+          "tokens" => %{"input" => 1, "output" => 1, "reasoning" => 0}
+        }
+      })
+    end
+
+    defp handle_scenario(:question, conn, state, session_id) do
+      FakeOpenCodeState.broadcast(state, "question.asked", %{
+        "id" => "question-1",
+        "sessionID" => session_id,
+        "question" => %{"header" => "Need confirmation"}
+      })
+
+      :ok = wait_for_question_reject(state, "question-1")
+
+      Process.sleep(1_000)
+      json(conn, 200, %{"info" => %{"id" => "assistant-message-4", "sessionID" => session_id}})
+    end
+
+    defp handle_scenario(:stall, conn, _state, session_id) do
+      Process.sleep(1_000)
+      json(conn, 200, %{"info" => %{"id" => "assistant-message-5", "sessionID" => session_id}})
+    end
+
+    defp handle_scenario(:message_post_timeout, conn, state, session_id) do
+      Enum.each(1..10, fn step ->
+        FakeOpenCodeState.broadcast(state, "message.part.delta", %{
+          "part" => %{
             "sessionID" => session_id,
-            "permission" => "read",
-            "patterns" => [Path.join(workspace, "README.md")]
-          })
+            "type" => "text",
+            "text" => "Still working #{step}"
+          }
+        })
 
-          :ok =
-            FakeOpenCodeState.wait_until(state, fn current ->
-              Enum.any?(current.permission_replies, fn
-                {^session_id, "perm-1", %{"response" => "once"}} -> true
-                _ -> false
-              end)
-            end)
+        Process.sleep(100)
+      end)
 
-          json(conn, 200, %{
-            "info" => %{
-              "id" => "assistant-message-2",
-              "sessionID" => session_id,
-              "tokens" => %{"input" => 2, "output" => 1, "reasoning" => 0}
-            }
-          })
+      json(conn, 200, %{"info" => %{"id" => "assistant-message-6", "sessionID" => session_id}})
+    end
 
-        :external_directory_permission ->
-          FakeOpenCodeState.broadcast(state, "permission.asked", %{
-            "id" => "perm-2",
-            "sessionID" => session_id,
-            "permission" => "external_directory",
-            "patterns" => ["/tmp/external"]
-          })
-
-          :ok =
-            FakeOpenCodeState.wait_until(state, fn current ->
-              Enum.any?(current.permission_replies, fn
-                {^session_id, "perm-2", %{"response" => "reject"}} -> true
-                _ -> false
-              end)
-            end)
-
-          json(conn, 200, %{
-            "info" => %{
-              "id" => "assistant-message-3",
-              "sessionID" => session_id,
-              "tokens" => %{"input" => 1, "output" => 1, "reasoning" => 0}
-            }
-          })
-
-        :question ->
-          FakeOpenCodeState.broadcast(state, "question.asked", %{
-            "id" => "question-1",
-            "sessionID" => session_id,
-            "question" => %{"header" => "Need confirmation"}
-          })
-
-          :ok =
-            FakeOpenCodeState.wait_until(state, fn current ->
-              Enum.any?(current.question_rejections, fn
-                {"question-1", %{}} -> true
-                _ -> false
-              end)
-            end)
-
-          Process.sleep(1_000)
-          json(conn, 200, %{"info" => %{"id" => "assistant-message-4", "sessionID" => session_id}})
-
-        :stall ->
-          Process.sleep(1_000)
-          json(conn, 200, %{"info" => %{"id" => "assistant-message-5", "sessionID" => session_id}})
-
-        :message_post_timeout ->
-          Enum.each(1..10, fn step ->
-            FakeOpenCodeState.broadcast(state, "message.part.delta", %{
-              "part" => %{
-                "sessionID" => session_id,
-                "type" => "text",
-                "text" => "Still working #{step}"
-              }
-            })
-
-            Process.sleep(100)
-          end)
-
-          json(conn, 200, %{"info" => %{"id" => "assistant-message-6", "sessionID" => session_id}})
+    defp wait_for_permission_reply(state, session_id, permission_id, response) do
+      matcher = fn
+        {^session_id, ^permission_id, %{"response" => ^response}} -> true
+        _reply -> false
       end
+
+      FakeOpenCodeState.wait_until(state, fn current ->
+        Enum.any?(current.permission_replies, matcher)
+      end)
+    end
+
+    defp wait_for_question_reject(state, request_id) do
+      matcher = fn
+        {^request_id, %{}} -> true
+        _rejection -> false
+      end
+
+      FakeOpenCodeState.wait_until(state, fn current ->
+        Enum.any?(current.question_rejections, matcher)
+      end)
     end
 
     defp broadcast_success_events(state, session_id) do
@@ -425,11 +435,27 @@ defmodule SymphonyElixir.AppServerTest do
                      1_000
 
       assert_receive {:agent_message, %{event: :turn_started, session_id: "session-test"}}, 1_000
-      assert_receive {:agent_message, %{event: "session.status", payload: %{"payload" => %{"type" => "session.status"}}}}, 1_000
+
+      assert_receive {:agent_message,
+                      %{event: "session.status", payload: %{"payload" => %{"type" => "session.status"}}}},
+                     1_000
+
       assert_receive {:agent_message, %{event: "message.part.delta"}}, 1_000
-      assert_receive {:agent_message, %{event: "message.part.updated", usage: %{input: 7, output: 2, reasoning: 1, total: 10}}}, 1_000
-      assert_receive {:agent_message, %{event: "message.updated", usage: %{input: 12, output: 4, reasoning: 3, total: 19}}}, 1_000
-      assert_receive {:agent_message, %{event: :turn_completed, usage: %{input: 12, output: 4, reasoning: 3, total: 19}}}, 1_000
+
+      assert_receive {:agent_message,
+                      %{event: "message.part.updated", usage: %{input: 7, output: 2, reasoning: 1, total: 10}}},
+                     1_000
+
+      assert_receive {:agent_message,
+                      %{event: "message.updated", usage: %{input: 12, output: 4, reasoning: 3, total: 19}}},
+                     1_000
+
+      assert_receive {:agent_message,
+                      %{
+                        event: :turn_completed,
+                        usage: %{input: 12, output: 4, reasoning: 3, total: 19}
+                      }},
+                     1_000
     after
       File.rm_rf(test_root)
     end
@@ -546,9 +572,14 @@ defmodule SymphonyElixir.AppServerTest do
       )
 
       assert {:ok, _result} =
-               AppServer.run(workspace, "Read the workspace", issue_fixture("issue-perm-allow", "MT-102", "Permission allow"))
+               AppServer.run(
+                 workspace,
+                 "Read the workspace",
+                 issue_fixture("issue-perm-allow", "MT-102", "Permission allow")
+               )
 
-      assert_receive {:fake_opencode_request, {:permission_reply, "session-test", "perm-1", %{"response" => "once"}}}, 1_000
+      assert_receive {:fake_opencode_request, {:permission_reply, "session-test", "perm-1", %{"response" => "once"}}},
+                     1_000
     after
       File.rm_rf(test_root)
     end
@@ -575,9 +606,14 @@ defmodule SymphonyElixir.AppServerTest do
       )
 
       assert {:ok, _result} =
-               AppServer.run(workspace, "Reject the external path", issue_fixture("issue-perm-reject", "MT-103", "Permission reject"))
+               AppServer.run(
+                 workspace,
+                 "Reject the external path",
+                 issue_fixture("issue-perm-reject", "MT-103", "Permission reject")
+               )
 
-      assert_receive {:fake_opencode_request, {:permission_reply, "session-test", "perm-2", %{"response" => "reject"}}}, 1_000
+      assert_receive {:fake_opencode_request, {:permission_reply, "session-test", "perm-2", %{"response" => "reject"}}},
+                     1_000
     after
       File.rm_rf(test_root)
     end
@@ -661,7 +697,11 @@ defmodule SymphonyElixir.AppServerTest do
       assert_receive {:agent_message, %{event: :turn_started, session_id: "session-test"}}, 1_000
       assert_receive {:agent_message, %{event: "message.part.delta"}}, 1_000
 
-      assert_receive {:agent_message, %{event: :turn_ended_with_error, reason: %{kind: :message_post_timeout, message: ^message}}},
+      assert_receive {:agent_message,
+                      %{
+                        event: :turn_ended_with_error,
+                        reason: %{kind: :message_post_timeout, message: ^message}
+                      }},
                      1_000
     after
       File.rm_rf(test_root)

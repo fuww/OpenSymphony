@@ -5,8 +5,8 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
 
   require Logger
 
-  alias SymphonyElixir.ClaudeCode.Tooling
   alias SymphonyElixir.{Accounts, Config, SSH, Telemetry}
+  alias SymphonyElixir.ClaudeCode.Tooling
 
   @poll_interval_ms 250
   @port_line_bytes 1_048_576
@@ -184,7 +184,11 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
   end
 
   defp start_port(workspace, worker_host, session_id, settings, issue, account) when is_binary(worker_host) do
-    SSH.start_port(worker_host, remote_launch_command(workspace, session_id, settings, issue, account), line: @port_line_bytes)
+    SSH.start_port(
+      worker_host,
+      remote_launch_command(workspace, session_id, settings, issue, account),
+      line: @port_line_bytes
+    )
   end
 
   defp launch_command(session_id, settings) do
@@ -234,8 +238,7 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
   defp remote_environment_exports(issue, account) do
     Config.settings!().tracker
     |> tracker_env_pairs(issue, account)
-    |> Enum.map(fn {key, value} -> "export #{key}=#{shell_escape(value)}" end)
-    |> Enum.join(" && ")
+    |> Enum.map_join(" && ", fn {key, value} -> "export #{key}=#{shell_escape(value)}" end)
   end
 
   defp port_environment(issue, account) do
@@ -297,26 +300,7 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
     receive do
       {port, {:data, {:eol, chunk}}} when port == session.port ->
         line = pending_line <> IO.chardata_to_string(chunk)
-
-        case handle_stream_line(line, session, on_message) do
-          {:continue, activity?} ->
-            now_ms = System.monotonic_time(:millisecond)
-
-            await_turn_result(
-              session,
-              on_message,
-              started_at_ms,
-              first_activity_ms || if(activity?, do: now_ms, else: nil),
-              if(activity?, do: now_ms, else: last_activity_ms),
-              ""
-            )
-
-          {:done, response} ->
-            {:ok, response}
-
-          {:error, reason} ->
-            {:error, reason}
-        end
+        handle_eol_line(line, session, on_message, started_at_ms, first_activity_ms, last_activity_ms)
 
       {port, {:data, {:noeol, chunk}}} when port == session.port ->
         await_turn_result(
@@ -332,34 +316,72 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
         {:error, {:port_exit, status}}
     after
       @poll_interval_ms ->
+        handle_turn_timeout(session, on_message, started_at_ms, first_activity_ms, last_activity_ms, pending_line)
+    end
+  end
+
+  defp handle_eol_line(line, session, on_message, started_at_ms, first_activity_ms, last_activity_ms) do
+    case handle_stream_line(line, session, on_message) do
+      {:continue, activity?} ->
         now_ms = System.monotonic_time(:millisecond)
 
-        cond do
-          session.turn_timeout_ms > 0 and now_ms - started_at_ms > session.turn_timeout_ms ->
-            stop_port(session.port)
-            {:error, :turn_timeout}
+        await_turn_result(
+          session,
+          on_message,
+          started_at_ms,
+          first_activity_ms || if(activity?, do: now_ms, else: nil),
+          if(activity?, do: now_ms, else: last_activity_ms),
+          ""
+        )
 
-          session.read_timeout_ms > 0 and is_nil(first_activity_ms) and
-              now_ms - started_at_ms > session.read_timeout_ms ->
-            stop_port(session.port)
-            {:error, :turn_start_timeout}
+      {:done, response} ->
+        {:ok, response}
 
-          session.stall_timeout_ms > 0 and is_integer(last_activity_ms) and
-              now_ms - last_activity_ms > session.stall_timeout_ms ->
-            stop_port(session.port)
-            {:error, :stall_timeout}
-
-          true ->
-            await_turn_result(
-              session,
-              on_message,
-              started_at_ms,
-              first_activity_ms,
-              last_activity_ms,
-              pending_line
-            )
-        end
+      {:error, reason} ->
+        {:error, reason}
     end
+  end
+
+  defp handle_turn_timeout(session, on_message, started_at_ms, first_activity_ms, last_activity_ms, pending_line) do
+    now_ms = System.monotonic_time(:millisecond)
+
+    cond do
+      turn_timed_out?(session, started_at_ms, now_ms) ->
+        stop_port(session.port)
+        {:error, :turn_timeout}
+
+      turn_start_timed_out?(session, started_at_ms, now_ms, first_activity_ms) ->
+        stop_port(session.port)
+        {:error, :turn_start_timeout}
+
+      turn_stalled?(session, last_activity_ms, now_ms) ->
+        stop_port(session.port)
+        {:error, :stall_timeout}
+
+      true ->
+        await_turn_result(
+          session,
+          on_message,
+          started_at_ms,
+          first_activity_ms,
+          last_activity_ms,
+          pending_line
+        )
+    end
+  end
+
+  defp turn_timed_out?(session, started_at_ms, now_ms) do
+    session.turn_timeout_ms > 0 and now_ms - started_at_ms > session.turn_timeout_ms
+  end
+
+  defp turn_start_timed_out?(session, started_at_ms, now_ms, first_activity_ms) do
+    session.read_timeout_ms > 0 and is_nil(first_activity_ms) and
+      now_ms - started_at_ms > session.read_timeout_ms
+  end
+
+  defp turn_stalled?(session, last_activity_ms, now_ms) do
+    session.stall_timeout_ms > 0 and is_integer(last_activity_ms) and
+      now_ms - last_activity_ms > session.stall_timeout_ms
   end
 
   defp handle_stream_line(line, session, on_message) when is_binary(line) do

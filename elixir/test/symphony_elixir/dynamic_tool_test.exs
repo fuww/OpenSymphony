@@ -209,7 +209,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert Jason.decode!(response["output"]) == %{
              "error" => %{
-               "message" => "`linear_graphql` expects either a GraphQL query string or an object with `query` and optional `variables`."
+               "message" =>
+                 "`linear_graphql` expects either a GraphQL query string or an object with `query` and optional `variables`."
              }
            }
   end
@@ -245,7 +246,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert Jason.decode!(missing_token["output"]) == %{
              "error" => %{
-               "message" => "Symphony is missing Linear auth. Set `tracker.api_key` in `symphony.yml` or export `LINEAR_API_KEY`."
+               "message" =>
+                 "Symphony is missing Linear auth. Set `tracker.api_key` in `symphony.yml` or export `LINEAR_API_KEY`."
              }
            }
 

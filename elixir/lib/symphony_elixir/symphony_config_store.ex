@@ -148,6 +148,8 @@ defmodule SymphonyElixir.SymphonyConfigStore do
   end
 
   defp log_reload_error(path, reason) do
-    Logger.error("Failed to reload symphony config path=#{path} reason=#{inspect(reason)}; keeping last known good configuration")
+    Logger.error(
+      "Failed to reload symphony config path=#{path} reason=#{inspect(reason)}; keeping last known good configuration"
+    )
   end
 end

@@ -417,7 +417,8 @@ defmodule SymphonyElixir.Linear.GraphqlTool do
   def tool_error_payload(:invalid_arguments) do
     %{
       "error" => %{
-        "message" => "`linear_graphql` expects either a GraphQL query string or an object with `query` and optional `variables`."
+        "message" =>
+          "`linear_graphql` expects either a GraphQL query string or an object with `query` and optional `variables`."
       }
     }
   end
@@ -433,7 +434,8 @@ defmodule SymphonyElixir.Linear.GraphqlTool do
   def tool_error_payload(:missing_linear_api_token) do
     %{
       "error" => %{
-        "message" => "Symphony is missing Linear auth. Set `tracker.api_key` in `symphony.yml` or export `LINEAR_API_KEY`."
+        "message" =>
+          "Symphony is missing Linear auth. Set `tracker.api_key` in `symphony.yml` or export `LINEAR_API_KEY`."
       }
     }
   end

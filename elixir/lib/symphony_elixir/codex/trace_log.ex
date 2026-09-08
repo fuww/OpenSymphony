@@ -106,7 +106,8 @@ defmodule SymphonyElixir.Codex.TraceLog do
       "thread_id" => value(message, [:thread_id, "thread_id"]) || Map.get(context, :thread_id),
       "turn_id" => value(message, [:turn_id, "turn_id"]) || Map.get(context, :turn_id),
       "issue_id" => value(message, [:issue_id, "issue_id"]) || Map.get(context, :issue_id),
-      "issue_identifier" => value(message, [:issue_identifier, "issue_identifier"]) || Map.get(context, :issue_identifier),
+      "issue_identifier" =>
+        value(message, [:issue_identifier, "issue_identifier"]) || Map.get(context, :issue_identifier),
       "worker_host" => value(message, [:worker_host, "worker_host"]),
       "codex_app_server_pid" => value(message, [:codex_app_server_pid, "codex_app_server_pid"])
     }
@@ -226,8 +227,12 @@ defmodule SymphonyElixir.Codex.TraceLog do
 
   defp classify_method("item/started", payload, message), do: item_lifecycle("item_started", payload, message)
   defp classify_method("item/completed", payload, message), do: item_lifecycle("item_completed", payload, message)
-  defp classify_method("codex/event/item_started", payload, message), do: wrapper_item_lifecycle("item_started", payload, message)
-  defp classify_method("codex/event/item_completed", payload, message), do: wrapper_item_lifecycle("item_completed", payload, message)
+
+  defp classify_method("codex/event/item_started", payload, message),
+    do: wrapper_item_lifecycle("item_started", payload, message)
+
+  defp classify_method("codex/event/item_completed", payload, message),
+    do: wrapper_item_lifecycle("item_completed", payload, message)
 
   defp classify_method(method, payload, message)
        when method in ["item/commandExecution/requestApproval", "execCommandApproval"] do
@@ -294,7 +299,8 @@ defmodule SymphonyElixir.Codex.TraceLog do
 
     %{
       "trace_kind" => kind,
-      "message" => "#{step_label(message)}: mcp tool #{tool || "unknown"} #{if kind == "mcp_tool_started", do: "started", else: "completed"}",
+      "message" =>
+        "#{step_label(message)}: mcp tool #{tool || "unknown"} #{if kind == "mcp_tool_started", do: "started", else: "completed"}",
       "tool_name" => tool
     }
     |> maybe_put_tool_arguments(payload)

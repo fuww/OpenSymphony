@@ -6,8 +6,8 @@ defmodule SymphonyElixir.IssueConfig do
   alias SymphonyElixir.Config
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.ProjectWorkflow
-  alias SymphonyElixir.Workspace
   alias SymphonyElixir.Workflow
+  alias SymphonyElixir.Workspace
 
   defstruct [
     :mode,
@@ -97,7 +97,14 @@ defmodule SymphonyElixir.IssueConfig do
     %{
       settings
       | agent: updated_agent,
-        hooks: merge_struct_fields(settings.hooks, workflow.hooks, [:after_create, :before_run, :after_run, :before_remove, :timeout_ms]),
+        hooks:
+          merge_struct_fields(settings.hooks, workflow.hooks, [
+            :after_create,
+            :before_run,
+            :after_run,
+            :before_remove,
+            :timeout_ms
+          ]),
         codex:
           merge_struct_fields(settings.codex, workflow.codex, [
             :command,

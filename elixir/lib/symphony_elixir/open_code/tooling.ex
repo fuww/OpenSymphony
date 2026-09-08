@@ -48,25 +48,32 @@ defmodule SymphonyElixir.OpenCode.Tooling do
         :ok
 
       exclude_path ->
-        :ok = File.mkdir_p(Path.dirname(exclude_path))
-
-        existing =
-          case File.read(exclude_path) do
-            {:ok, contents} -> contents
-            {:error, :enoent} -> ""
-            {:error, reason} -> raise File.Error, reason: reason, action: "read", path: exclude_path
-          end
-
-        if String.contains?(existing, @git_exclude_entry) do
-          :ok
-        else
-          prefix = if existing == "" or String.ends_with?(existing, "\n"), do: existing, else: existing <> "\n"
-          File.write(exclude_path, prefix <> @git_exclude_entry <> "\n")
-        end
+        write_git_exclude(exclude_path)
     end
   rescue
     error in [File.Error] ->
       {:error, error}
+  end
+
+  defp write_git_exclude(exclude_path) do
+    :ok = File.mkdir_p(Path.dirname(exclude_path))
+
+    existing = read_git_exclude(exclude_path)
+
+    if String.contains?(existing, @git_exclude_entry) do
+      :ok
+    else
+      prefix = if existing == "" or String.ends_with?(existing, "\n"), do: existing, else: existing <> "\n"
+      File.write(exclude_path, prefix <> @git_exclude_entry <> "\n")
+    end
+  end
+
+  defp read_git_exclude(exclude_path) do
+    case File.read(exclude_path) do
+      {:ok, contents} -> contents
+      {:error, :enoent} -> ""
+      {:error, reason} -> raise File.Error, reason: reason, action: "read", path: exclude_path
+    end
   end
 
   defp git_exclude_path(workspace) do

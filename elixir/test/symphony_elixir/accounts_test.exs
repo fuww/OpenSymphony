@@ -206,7 +206,12 @@ defmodule SymphonyElixir.AccountsTest do
   test "codex login streams provider output while storing isolated account metadata" do
     store_root = temp_accounts_root!("login-stream")
     settings = accounts_settings!(store_root)
-    command = fake_provider_command!("codex-login", "printf 'Visit https://example.test/device\\nLogged in as streamed@example.com\\n'")
+
+    command =
+      fake_provider_command!(
+        "codex-login",
+        "printf 'Visit https://example.test/device\\nLogged in as streamed@example.com\\n'"
+      )
 
     output =
       ExUnit.CaptureIO.capture_io(fn ->

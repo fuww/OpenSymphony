@@ -1932,16 +1932,20 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            }
          }
        }, "item started: command execution"},
-      {"item/completed", %{"params" => %{"item" => %{"type" => "fileChange", "status" => "completed"}}}, "item completed: file change"},
+      {"item/completed", %{"params" => %{"item" => %{"type" => "fileChange", "status" => "completed"}}},
+       "item completed: file change"},
       {"item/agentMessage/delta", %{"params" => %{"delta" => "hello"}}, "agent message streaming"},
       {"item/plan/delta", %{"params" => %{"delta" => "step"}}, "plan streaming"},
       {"item/reasoning/summaryTextDelta", %{"params" => %{"summaryText" => "thinking"}}, "reasoning summary streaming"},
-      {"item/reasoning/summaryPartAdded", %{"params" => %{"summaryText" => "section"}}, "reasoning summary section added"},
+      {"item/reasoning/summaryPartAdded", %{"params" => %{"summaryText" => "section"}},
+       "reasoning summary section added"},
       {"item/reasoning/textDelta", %{"params" => %{"textDelta" => "reason"}}, "reasoning text streaming"},
       {"item/commandExecution/outputDelta", %{"params" => %{"outputDelta" => "ok"}}, "command output streaming"},
       {"item/fileChange/outputDelta", %{"params" => %{"outputDelta" => "changed"}}, "file change output streaming"},
-      {"item/commandExecution/requestApproval", %{"params" => %{"parsedCmd" => "git status"}}, "command approval requested (git status)"},
-      {"item/fileChange/requestApproval", %{"params" => %{"fileChangeCount" => 2}}, "file change approval requested (2 files)"},
+      {"item/commandExecution/requestApproval", %{"params" => %{"parsedCmd" => "git status"}},
+       "command approval requested (git status)"},
+      {"item/fileChange/requestApproval", %{"params" => %{"fileChangeCount" => 2}},
+       "file change approval requested (2 files)"},
       {"item/tool/call", %{"params" => %{"tool" => "linear_graphql"}}, "dynamic tool call requested (linear_graphql)"},
       {"item/tool/requestUserInput", %{"params" => %{"question" => "Continue?"}}, "tool requires user input: Continue?"}
     ]

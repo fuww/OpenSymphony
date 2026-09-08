@@ -427,7 +427,9 @@ defmodule SymphonyElixir.LiveE2ETest do
         output
 
       {:ok, {output, status}} ->
-        flunk("failed to read remote result from #{worker_host}:#{remote_result_path} (status #{status}): #{inspect(output)}")
+        flunk(
+          "failed to read remote result from #{worker_host}:#{remote_result_path} (status #{status}): #{inspect(output)}"
+        )
 
       {:error, reason} ->
         flunk("failed to read remote result from #{worker_host}:#{remote_result_path}: #{inspect(reason)}")

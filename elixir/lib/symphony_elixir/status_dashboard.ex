@@ -405,8 +405,7 @@ defmodule SymphonyElixir.StatusDashboard do
         routes ->
           {"Projects",
            routes
-           |> Enum.map(&linear_project_url(&1.slug))
-           |> Enum.join(", ")
+           |> Enum.map_join(", ", &linear_project_url(&1.slug))
            |> colorize(@ansi_cyan)}
       end
 
@@ -1011,11 +1010,28 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp format_rate_limits(rate_limits) when is_map(rate_limits) do
     limit_id =
-      map_value(rate_limits, ["limit_id", :limit_id, "limitId", :limitId, "limit_name", :limit_name, "limitName", :limitName]) ||
+      map_value(rate_limits, [
+        "limit_id",
+        :limit_id,
+        "limitId",
+        :limitId,
+        "limit_name",
+        :limit_name,
+        "limitName",
+        :limitName
+      ]) ||
         "unknown"
 
-    session = format_rate_limit_bucket(map_value(rate_limits, ["session", :session]) || map_value(rate_limits, ["primary", :primary]))
-    weekly = format_rate_limit_bucket(map_value(rate_limits, ["weekly", :weekly]) || map_value(rate_limits, ["secondary", :secondary]))
+    session =
+      format_rate_limit_bucket(
+        map_value(rate_limits, ["session", :session]) || map_value(rate_limits, ["primary", :primary])
+      )
+
+    weekly =
+      format_rate_limit_bucket(
+        map_value(rate_limits, ["weekly", :weekly]) || map_value(rate_limits, ["secondary", :secondary])
+      )
+
     credits = format_rate_limit_credits(map_value(rate_limits, ["credits", :credits]))
 
     colorize(to_string(limit_id), @ansi_yellow) <>
@@ -1447,7 +1463,9 @@ defmodule SymphonyElixir.StatusDashboard do
   defp humanize_codex_event(:unsupported_tool_call, _message, payload),
     do: humanize_dynamic_tool_event("unsupported dynamic tool call rejected", payload)
 
-  defp humanize_codex_event(:turn_ended_with_error, message, _payload), do: "turn ended with error: #{format_reason(message)}"
+  defp humanize_codex_event(:turn_ended_with_error, message, _payload),
+    do: "turn ended with error: #{format_reason(message)}"
+
   defp humanize_codex_event(:startup_failed, message, _payload), do: "startup failed: #{format_reason(message)}"
   defp humanize_codex_event(:turn_failed, _message, payload), do: humanize_codex_method("turn/failed", payload)
   defp humanize_codex_event(:turn_cancelled, _message, _payload), do: "turn cancelled"

@@ -205,7 +205,9 @@ defmodule SymphonyElixir.CodexAppServerTest do
       )
 
       assert {:ok, _result} =
-               AppServer.run(workspace, "Use maximum effort", issue_fixture("MT-1001-EFFORT", "Maximum effort"), effort: "max")
+               AppServer.run(workspace, "Use maximum effort", issue_fixture("MT-1001-EFFORT", "Maximum effort"),
+                 effort: "max"
+               )
 
       trace = File.read!(trace_file)
       assert trace =~ "ARGV:app-server -c model_reasoning_effort=xhigh"
@@ -880,7 +882,9 @@ defmodule SymphonyElixir.CodexAppServerTest do
       trace = File.read!(trace_file)
       assert trace =~ ~s(otel.exporter={ otlp-http = { endpoint = "http://localhost:4318", protocol = "json" } })
       assert trace =~ ~s(otel.trace_exporter={ otlp-http = { endpoint = "http://localhost:4318", protocol = "json" } })
-      assert trace =~ ~s(otel.metrics_exporter={ otlp-http = { endpoint = "http://localhost:4318", protocol = "json" } })
+
+      assert trace =~
+               ~s(otel.metrics_exporter={ otlp-http = { endpoint = "http://localhost:4318", protocol = "json" } })
     after
       File.rm_rf(test_root)
     end
@@ -920,9 +924,16 @@ defmodule SymphonyElixir.CodexAppServerTest do
                AppServer.run(workspace, "Metrics endpoint", issue_fixture("MT-METRICS", "Metrics"))
 
       trace = File.read!(trace_file)
-      assert trace =~ ~s(otel.exporter={ otlp-http = { endpoint = "http://metrics.example:4318/v1/metrics", protocol = "json" } })
-      assert trace =~ ~s(otel.trace_exporter={ otlp-http = { endpoint = "http://metrics.example:4318/v1/metrics", protocol = "json" } })
-      assert trace =~ ~s(otel.metrics_exporter={ otlp-http = { endpoint = "http://metrics.example:4318/v1/metrics", protocol = "json" } })
+
+      assert trace =~
+               ~s(otel.exporter={ otlp-http = { endpoint = "http://metrics.example:4318/v1/metrics", protocol = "json" } })
+
+      assert trace =~
+               ~s(otel.trace_exporter={ otlp-http = { endpoint = "http://metrics.example:4318/v1/metrics", protocol = "json" } })
+
+      assert trace =~
+               ~s(otel.metrics_exporter={ otlp-http = { endpoint = "http://metrics.example:4318/v1/metrics", protocol = "json" } })
+
       assert trace =~ ~s(-c otel.log_user_prompt=true)
       assert trace =~ ~s(-c otel.log_tool_details=true)
       refute trace =~ ~s(endpoint = "http://generic.example:4317")

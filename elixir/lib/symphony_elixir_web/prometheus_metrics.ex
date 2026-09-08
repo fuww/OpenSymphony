@@ -163,53 +163,53 @@ defmodule SymphonyElixirWeb.PrometheusMetrics do
     active_rows = active_usage_period_rows(account)
     closed_rows = closed_usage_period_rows(account)
 
-    (active_rows ++ closed_rows)
-    |> Enum.flat_map(fn row ->
-      labels =
-        base_identity ++
-          [
-            limit_id: string_value(Map.get(row, "limit_id")),
-            bucket: string_value(Map.get(row, "bucket")),
-            period: string_value(Map.get(row, "period")),
-            period_started_at: string_value(Map.get(row, "period_started_at")),
-            reset_at: string_value(Map.get(row, "reset_at")),
-            period_status: string_value(Map.get(row, "period_status"))
-          ]
+    Enum.flat_map(active_rows ++ closed_rows, &usage_period_row_samples(&1, base_identity))
+  end
 
-      limit = integer_value(Map.get(row, "limit"))
-      remaining = integer_value(Map.get(row, "remaining"))
-      used = integer_value(Map.get(row, "used")) || if(is_integer(limit) and is_integer(remaining), do: max(limit - remaining, 0))
-      usage_percent = float_value(Map.get(row, "usage_percent")) || percent_value(used, limit)
-
-      token_samples =
+  defp usage_period_row_samples(row, base_identity) do
+    labels =
+      base_identity ++
         [
-          {"input", integer_value(Map.get(row, "input_tokens"))},
-          {"output", integer_value(Map.get(row, "output_tokens"))},
-          {"total", integer_value(Map.get(row, "total_tokens"))}
+          limit_id: string_value(Map.get(row, "limit_id")),
+          bucket: string_value(Map.get(row, "bucket")),
+          period: string_value(Map.get(row, "period")),
+          period_started_at: string_value(Map.get(row, "period_started_at")),
+          reset_at: string_value(Map.get(row, "reset_at")),
+          period_status: string_value(Map.get(row, "period_status"))
         ]
-        |> Enum.flat_map(fn {token_type, value} ->
-          case value do
-            nil ->
-              []
 
-            numeric ->
-              [
-                %{
-                  name: "symphony_account_usage_period_tokens",
-                  labels: labels ++ [token_type: token_type],
-                  value: numeric
-                }
-              ]
-          end
-        end)
+    limit = integer_value(Map.get(row, "limit"))
+    remaining = integer_value(Map.get(row, "remaining"))
+    used = integer_value(Map.get(row, "used")) || bucket_used(limit, remaining)
+    usage_percent = float_value(Map.get(row, "usage_percent")) || percent_value(used, limit)
 
-      (token_samples ++
-         [])
-      |> maybe_add_sample("symphony_account_usage_period_limit", labels, limit)
-      |> maybe_add_sample("symphony_account_usage_period_remaining", labels, remaining)
-      |> maybe_add_sample("symphony_account_usage_period_used", labels, used)
-      |> maybe_add_sample("symphony_account_usage_period_usage_percent", labels, usage_percent)
-    end)
+    row
+    |> usage_period_token_samples(labels)
+    |> maybe_add_sample("symphony_account_usage_period_limit", labels, limit)
+    |> maybe_add_sample("symphony_account_usage_period_remaining", labels, remaining)
+    |> maybe_add_sample("symphony_account_usage_period_used", labels, used)
+    |> maybe_add_sample("symphony_account_usage_period_usage_percent", labels, usage_percent)
+  end
+
+  defp usage_period_token_samples(row, labels) do
+    [
+      {"input", integer_value(Map.get(row, "input_tokens"))},
+      {"output", integer_value(Map.get(row, "output_tokens"))},
+      {"total", integer_value(Map.get(row, "total_tokens"))}
+    ]
+    |> Enum.flat_map(&token_sample(&1, labels))
+  end
+
+  defp token_sample({_token_type, nil}, _labels), do: []
+
+  defp token_sample({token_type, numeric}, labels) do
+    [
+      %{
+        name: "symphony_account_usage_period_tokens",
+        labels: labels ++ [token_type: token_type],
+        value: numeric
+      }
+    ]
   end
 
   defp active_usage_period_rows(account) do
@@ -336,8 +336,12 @@ defmodule SymphonyElixirWeb.PrometheusMetrics do
     limit_id = rate_limit_id(rate_limits)
 
     [
-      {"session", Map.get(rate_limits, "session") || Map.get(rate_limits, :session) || Map.get(rate_limits, "primary") || Map.get(rate_limits, :primary)},
-      {"weekly", Map.get(rate_limits, "weekly") || Map.get(rate_limits, :weekly) || Map.get(rate_limits, "secondary") || Map.get(rate_limits, :secondary)}
+      {"session",
+       Map.get(rate_limits, "session") || Map.get(rate_limits, :session) || Map.get(rate_limits, "primary") ||
+         Map.get(rate_limits, :primary)},
+      {"weekly",
+       Map.get(rate_limits, "weekly") || Map.get(rate_limits, :weekly) || Map.get(rate_limits, "secondary") ||
+         Map.get(rate_limits, :secondary)}
     ]
     |> Enum.filter(fn {_bucket_name, bucket} -> is_map(bucket) end)
     |> Enum.map(fn {bucket_name, bucket} -> {bucket_name, limit_id, bucket} end)
@@ -356,22 +360,21 @@ defmodule SymphonyElixirWeb.PrometheusMetrics do
 
   defp normalize_active_usage_period_row(period, bucket_name, current_bucket_data) when is_map(period) do
     current_bucket = bucket_from_bucket_data(current_bucket_data)
-    current_limit_id = limit_id_from_bucket_data(current_bucket_data)
-    limit = integer_value(map_value(period, :limit) || map_value(current_bucket, :limit))
-    remaining = integer_value(map_value(period, :remaining) || map_value(current_bucket, :remaining))
-    used = integer_value(map_value(period, :used)) || bucket_used(limit, remaining)
+    limit = active_row_limit(period, current_bucket)
+    remaining = active_row_remaining(period, current_bucket)
+    used = active_row_used(period, limit, remaining)
 
     %{
-      "limit_id" => map_value(period, :limit_id) || current_limit_id,
+      "limit_id" => map_value(period, :limit_id) || limit_id_from_bucket_data(current_bucket_data),
       "bucket" => map_value(period, :bucket) || bucket_name,
       "period" => map_value(period, :period) || bucket_name,
-      "period_started_at" => datetime_string(map_value(period, :started_at)) || bucket_period_started_at(current_bucket),
-      "reset_at" => datetime_string(map_value(period, :reset_at)) || bucket_reset_at_string(current_bucket),
+      "period_started_at" => active_row_period_started_at(period, current_bucket),
+      "reset_at" => active_row_reset_at(period, current_bucket),
       "period_status" => "active",
       "limit" => limit,
       "remaining" => remaining,
       "used" => used,
-      "usage_percent" => float_value(map_value(period, :usage_percent)) || bucket_usage_percent(current_bucket, used, limit),
+      "usage_percent" => active_row_usage_percent(period, current_bucket, used, limit),
       "input_tokens" => integer_value(map_value(period, :input_tokens)),
       "output_tokens" => integer_value(map_value(period, :output_tokens)),
       "total_tokens" => integer_value(map_value(period, :total_tokens))
@@ -379,6 +382,30 @@ defmodule SymphonyElixirWeb.PrometheusMetrics do
   end
 
   defp normalize_active_usage_period_row(_period, _bucket_name, _current_bucket_data), do: nil
+
+  defp active_row_limit(period, current_bucket) do
+    integer_value(map_value(period, :limit) || map_value(current_bucket, :limit))
+  end
+
+  defp active_row_remaining(period, current_bucket) do
+    integer_value(map_value(period, :remaining) || map_value(current_bucket, :remaining))
+  end
+
+  defp active_row_used(period, limit, remaining) do
+    integer_value(map_value(period, :used)) || bucket_used(limit, remaining)
+  end
+
+  defp active_row_period_started_at(period, current_bucket) do
+    datetime_string(map_value(period, :started_at)) || bucket_period_started_at(current_bucket)
+  end
+
+  defp active_row_reset_at(period, current_bucket) do
+    datetime_string(map_value(period, :reset_at)) || bucket_reset_at_string(current_bucket)
+  end
+
+  defp active_row_usage_percent(period, current_bucket, used, limit) do
+    float_value(map_value(period, :usage_percent)) || bucket_usage_percent(current_bucket, used, limit)
+  end
 
   defp fallback_active_usage_period_row(bucket_name, %{limit_id: limit_id, bucket: bucket})
        when is_map(bucket) do
@@ -468,28 +495,32 @@ defmodule SymphonyElixirWeb.PrometheusMetrics do
   end
 
   defp reset_time(bucket) when is_map(bucket) do
-    absolute =
-      Map.get(bucket, "reset_at") ||
-        Map.get(bucket, :reset_at) ||
-        Map.get(bucket, "resetAt") ||
-        Map.get(bucket, :resetAt) ||
-        Map.get(bucket, "resets_at") ||
-        Map.get(bucket, :resets_at) ||
-        Map.get(bucket, "resetsAt") ||
-        Map.get(bucket, :resetsAt)
-
-    relative =
-      Map.get(bucket, "reset_in_seconds") ||
-        Map.get(bucket, :reset_in_seconds) ||
-        Map.get(bucket, "resets_in_seconds") ||
-        Map.get(bucket, :resets_in_seconds) ||
-        Map.get(bucket, "reset_after_seconds") ||
-        Map.get(bucket, :reset_after_seconds)
-
-    normalize_datetime(absolute) || relative_reset(relative)
+    normalize_datetime(reset_time_absolute(bucket)) || relative_reset(reset_time_relative(bucket))
   end
 
   defp reset_time(_bucket), do: nil
+
+  defp reset_time_absolute(bucket) do
+    first_map_value(bucket, ["reset_at", :reset_at, "resetAt", :resetAt, "resets_at", :resets_at, "resetsAt", :resetsAt])
+  end
+
+  defp reset_time_relative(bucket) do
+    first_map_value(
+      bucket,
+      [
+        "reset_in_seconds",
+        :reset_in_seconds,
+        "resets_in_seconds",
+        :resets_in_seconds,
+        "reset_after_seconds",
+        :reset_after_seconds
+      ]
+    )
+  end
+
+  defp first_map_value(map, keys) do
+    Enum.find_value(keys, fn key -> Map.get(map, key) end)
+  end
 
   defp bucket_usage_percent(bucket, used, limit) when is_map(bucket) do
     float_value(
@@ -546,10 +577,7 @@ defmodule SymphonyElixirWeb.PrometheusMetrics do
   defp render_labels([]), do: ""
 
   defp render_labels(labels) do
-    rendered =
-      labels
-      |> Enum.map(fn {key, value} -> "#{key}=\"#{escape_label_value(value)}\"" end)
-      |> Enum.join(",")
+    rendered = Enum.map_join(labels, ",", fn {key, value} -> "#{key}=\"#{escape_label_value(value)}\"" end)
 
     "{#{rendered}}"
   end

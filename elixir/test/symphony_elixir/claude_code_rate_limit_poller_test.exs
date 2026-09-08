@@ -33,7 +33,9 @@ defmodule SymphonyElixir.ClaudeCode.RateLimitPollerTest do
     end
 
     pid =
-      start_supervised!({RateLimitPoller, name: :"rate_limit_poller_#{System.unique_integer([:positive])}", probe_fun: probe_fun})
+      start_supervised!(
+        {RateLimitPoller, name: :"rate_limit_poller_#{System.unique_integer([:positive])}", probe_fun: probe_fun}
+      )
 
     RateLimitPoller.poll_now(pid)
     ensure_poll_completed(pid)
@@ -53,7 +55,9 @@ defmodule SymphonyElixir.ClaudeCode.RateLimitPollerTest do
     probe_fun = fn _account -> flunk("probe should not run when accounts disabled") end
 
     pid =
-      start_supervised!({RateLimitPoller, name: :"rate_limit_poller_#{System.unique_integer([:positive])}", probe_fun: probe_fun})
+      start_supervised!(
+        {RateLimitPoller, name: :"rate_limit_poller_#{System.unique_integer([:positive])}", probe_fun: probe_fun}
+      )
 
     RateLimitPoller.poll_now(pid)
     ensure_poll_completed(pid)

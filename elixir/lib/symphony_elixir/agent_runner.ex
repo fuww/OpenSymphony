@@ -145,7 +145,16 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
+  defp do_run_codex_turns(
+         app_session,
+         workspace,
+         issue,
+         codex_update_recipient,
+         opts,
+         issue_state_fetcher,
+         turn_number,
+         max_turns
+       ) do
     prompt = build_codex_turn_prompt(issue, opts, turn_number, max_turns)
 
     with {:ok, turn_session} <-
@@ -156,11 +165,15 @@ defmodule SymphonyElixir.AgentRunner do
              on_message: codex_message_handler(codex_update_recipient, issue),
              turn_number: turn_number
            ) do
-      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
+      Logger.info(
+        "Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}"
+      )
 
       case continue_with_issue?(issue, issue_state_fetcher) do
         {:continue, refreshed_issue} when turn_number < max_turns ->
-          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+          Logger.info(
+            "Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}"
+          )
 
           do_run_codex_turns(
             app_session,
@@ -174,7 +187,9 @@ defmodule SymphonyElixir.AgentRunner do
           )
 
         {:continue, refreshed_issue} ->
-          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+          Logger.info(
+            "Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator"
+          )
 
           :ok
 
@@ -219,7 +234,16 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp do_run_agent_turns(app_session, workspace, issue, agent_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
+  defp do_run_agent_turns(
+         app_session,
+         workspace,
+         issue,
+         agent_update_recipient,
+         opts,
+         issue_state_fetcher,
+         turn_number,
+         max_turns
+       ) do
     prompt = build_agent_turn_prompt(issue, opts, turn_number, max_turns)
 
     with {:ok, turn_session} <-
@@ -230,11 +254,15 @@ defmodule SymphonyElixir.AgentRunner do
              backend: Keyword.get(opts, :backend),
              on_message: agent_message_handler(agent_update_recipient, issue)
            ) do
-      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
+      Logger.info(
+        "Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}"
+      )
 
       case continue_with_issue?(issue, issue_state_fetcher) do
         {:continue, refreshed_issue} when turn_number < max_turns ->
-          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+          Logger.info(
+            "Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}"
+          )
 
           do_run_agent_turns(
             app_session,
@@ -248,7 +276,9 @@ defmodule SymphonyElixir.AgentRunner do
           )
 
         {:continue, refreshed_issue} ->
-          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+          Logger.info(
+            "Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator"
+          )
 
           :ok
 
@@ -291,9 +321,16 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp prepare_workspace_for_backend(workspace, worker_host, backend, issue_config) do
     case backend do
-      "opencode" -> Tooling.bootstrap_workspace(workspace)
-      "claude" -> ClaudeCodeTooling.bootstrap_workspace(workspace, worker_host, timeout_ms: issue_config.settings.hooks.timeout_ms)
-      _ -> :ok
+      "opencode" ->
+        Tooling.bootstrap_workspace(workspace)
+
+      "claude" ->
+        ClaudeCodeTooling.bootstrap_workspace(workspace, worker_host,
+          timeout_ms: issue_config.settings.hooks.timeout_ms
+        )
+
+      _ ->
+        :ok
     end
   end
 

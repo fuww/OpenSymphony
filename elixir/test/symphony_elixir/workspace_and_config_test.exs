@@ -1866,7 +1866,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       init_repo!(repo_root, "project b\n")
       System.cmd("git", ["-C", repo_root, "checkout", "-b", "feature/example-branch"])
       File.write!(Path.join(repo_root, "ONLY_SWITCH_TO_TS"), "branch-specific\n")
-      write_project_workflow_file!(Path.join(repo_root, "WORKFLOW.md"), prompt: "Branch workflow for {{ issue.identifier }}")
+
+      write_project_workflow_file!(Path.join(repo_root, "WORKFLOW.md"),
+        prompt: "Branch workflow for {{ issue.identifier }}"
+      )
+
       System.cmd("git", ["-C", repo_root, "add", "WORKFLOW.md", "ONLY_SWITCH_TO_TS"])
       System.cmd("git", ["-C", repo_root, "commit", "-m", "Add branch workflow"])
       System.cmd("git", ["-C", repo_root, "checkout", "main"])
@@ -1915,7 +1919,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       init_repo!(repo_root, "global workflow routing\n")
 
-      write_project_workflow_repo_file!(repo_root, "PRODUCT_WORKFLOW.md", hook_after_create: "printf project-hook > .project-hook.txt")
+      write_project_workflow_repo_file!(repo_root, "PRODUCT_WORKFLOW.md",
+        hook_after_create: "printf project-hook > .project-hook.txt"
+      )
 
       write_symphony_config_file!(config_path,
         workspace_root: workspace_root,

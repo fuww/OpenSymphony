@@ -161,7 +161,10 @@ defmodule Mix.Tasks.Workspace.BeforeRemoveTest do
         assert error_output =~ "Failed to close PR #102 for branch feature/no-output: exit 17"
         refute error_output =~ "output="
         log = File.read!(log_path)
-        assert log =~ "pr list --repo openai/symphony --head feature/no-output --state open --json number --jq .[].number"
+
+        assert log =~
+                 "pr list --repo openai/symphony --head feature/no-output --state open --json number --jq .[].number"
+
         assert log =~ "pr close 102 --repo openai/symphony"
       end
     )
