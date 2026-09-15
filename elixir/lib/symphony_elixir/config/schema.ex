@@ -803,7 +803,7 @@ defmodule SymphonyElixir.Config.Schema do
          changeset <- changeset(normalized_config),
          {:ok, settings} <- apply_action(changeset, :validate),
          finalized_settings <- finalize_settings(settings, normalized_config, opts),
-         :ok <- validate_open_code_local_only(finalized_settings),
+         :ok <- validate_open_code_worker_mode(finalized_settings),
          :ok <- validate_worker_mode(finalized_settings) do
       {:ok, finalized_settings}
     else
@@ -1426,11 +1426,15 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
-  defp validate_open_code_local_only(%__MODULE__{agent: %{backend: backend}})
+  defp validate_open_code_worker_mode(%__MODULE__{agent: %{backend: backend}})
        when backend in ["codex", "claude"],
        do: :ok
 
-  defp validate_open_code_local_only(settings) do
+  # OpenCode runs locally or in Kubernetes (its in-pod HTTP API is reached via a
+  # `kubectl port-forward` — see `OpenCode.AppServer`), but never over SSH workers: there is
+  # no reachability path for its HTTP server across an ssh hop. `worker.ssh_hosts` and the
+  # per-host concurrency cap are ssh-only knobs and stay rejected outside Kubernetes.
+  defp validate_open_code_worker_mode(settings) do
     ssh_hosts =
       settings.worker.ssh_hosts
       |> List.wrap()
@@ -1438,18 +1442,18 @@ defmodule SymphonyElixir.Config.Schema do
       |> Enum.map(&String.trim/1)
       |> Enum.reject(&(&1 == ""))
 
+    kubernetes? = settings.worker.mode == "kubernetes"
+
     cond do
       ssh_hosts != [] ->
-        {:error, {:invalid_workflow_config, "OpenCode v1 is local-only. Remove `worker.ssh_hosts` from `WORKFLOW.md`."}}
-
-      settings.worker.mode == "kubernetes" ->
-        {:error,
-         {:invalid_workflow_config, "OpenCode v1 is local-only. Remove `worker.mode: kubernetes` from `WORKFLOW.md`."}}
-
-      is_integer(settings.worker.max_concurrent_agents_per_host) ->
         {:error,
          {:invalid_workflow_config,
-          "OpenCode v1 is local-only. Remove `worker.max_concurrent_agents_per_host` from `WORKFLOW.md`."}}
+          "OpenCode does not support SSH workers. Remove `worker.ssh_hosts` from `WORKFLOW.md` (use `worker.mode: kubernetes` for remote runs)."}}
+
+      not kubernetes? and is_integer(settings.worker.max_concurrent_agents_per_host) ->
+        {:error,
+         {:invalid_workflow_config,
+          "OpenCode does not support `worker.max_concurrent_agents_per_host` outside Kubernetes. Remove it from `WORKFLOW.md`."}}
 
       true ->
         :ok

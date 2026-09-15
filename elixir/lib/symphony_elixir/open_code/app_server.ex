@@ -5,7 +5,8 @@ defmodule SymphonyElixir.OpenCode.AppServer do
 
   require Logger
 
-  alias SymphonyElixir.{Config, PathSafety, Telemetry}
+  alias SymphonyElixir.{AgentStream, Config, PathSafety, Remote, Telemetry}
+  alias SymphonyElixir.K8s.PortForward
 
   @allowed_unattended_permissions MapSet.new([
                                     "read",
@@ -30,12 +31,14 @@ defmodule SymphonyElixir.OpenCode.AppServer do
   @port_log_preview_bytes 1_000
 
   @type session :: %{
-          port: port(),
+          stream: AgentStream.t(),
+          port_forward: port() | nil,
           request: Req.Request.t(),
           base_url: String.t(),
           session_id: String.t(),
           metadata: map(),
           workspace: Path.t(),
+          worker_host: String.t() | nil,
           agent: String.t(),
           model: String.t() | nil,
           variant: String.t() | nil,
@@ -60,27 +63,60 @@ defmodule SymphonyElixir.OpenCode.AppServer do
     worker_host = Keyword.get(opts, :worker_host)
     variant = Keyword.get(opts, :variant)
     issue = Keyword.get(opts, :issue)
+    # Overridable so tests can substitute the `kubectl port-forward` step, which needs a
+    # real cluster; production always uses the default.
+    port_forward_fun = Keyword.get(opts, :port_forward_fun, &PortForward.start/3)
 
     with {:ok, settings} <- Config.opencode_runtime_settings(variant: variant),
          {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
-         {:ok, port} <- start_port(expanded_workspace, worker_host, settings.command, issue) do
-      metadata = port_metadata(port)
+         {:ok, stream} <- start_port(expanded_workspace, worker_host, settings.command, issue) do
+      metadata = port_metadata(stream)
       startup_context = startup_context(expanded_workspace, settings, metadata)
-      read_timeout_ms = settings.read_timeout_ms
 
-      with {:ok, base_url} <- await_server_url(port, startup_context, ""),
-           request_context <- Map.put(startup_context, :base_url, base_url),
-           request <- build_request(base_url, read_timeout_ms),
-           :ok <- await_health(request, request_context),
-           {:ok, session_id} <- create_session(request, expanded_workspace, request_context) do
+      case connect_http_session(
+             stream,
+             worker_host,
+             expanded_workspace,
+             settings,
+             metadata,
+             startup_context,
+             port_forward_fun
+           ) do
+        {:ok, session} ->
+          {:ok, session}
+
+        {:error, reason} ->
+          AgentStream.close(stream)
+          {:error, reason}
+      end
+    end
+  end
+
+  # Drives the HTTP handshake once the server process is spawned. In Kubernetes mode this
+  # also opens the `kubectl port-forward` that makes the pod-local server reachable and
+  # rewrites `base_url` to its local end. The port-forward is torn down here on any failure
+  # after it is opened; the caller always closes the `stream`.
+  defp connect_http_session(stream, worker_host, workspace, settings, metadata, startup_context, port_forward_fun) do
+    read_timeout_ms = settings.read_timeout_ms
+
+    with {:ok, server_url} <- await_server_url(stream, startup_context, ""),
+         {:ok, base_url, port_forward} <-
+           reachable_base_url(worker_host, server_url, startup_context, port_forward_fun) do
+      request_context = Map.put(startup_context, :base_url, base_url)
+      request = build_request(base_url, read_timeout_ms)
+
+      with :ok <- await_health(request, request_context),
+           {:ok, session_id} <- create_session(request, workspace, request_context) do
         {:ok,
          %{
-           port: port,
+           stream: stream,
+           port_forward: port_forward,
            request: request,
            base_url: base_url,
            session_id: session_id,
            metadata: metadata,
-           workspace: expanded_workspace,
+           workspace: workspace,
+           worker_host: worker_host,
            agent: settings.agent,
            model: settings.model,
            variant: settings.variant,
@@ -90,11 +126,77 @@ defmodule SymphonyElixir.OpenCode.AppServer do
          }}
       else
         {:error, reason} ->
-          stop_port(port)
+          stop_port_forward(port_forward)
           {:error, reason}
       end
     end
   end
+
+  # Local: the URL the server printed binds the orchestrator's own loopback, so it is
+  # already reachable — no port-forward.
+  defp reachable_base_url(nil, server_url, _context, _port_forward_fun) do
+    {:ok, server_url, nil}
+  end
+
+  # Kubernetes: the server bound `127.0.0.1:<port>` inside the pod. Open a `kubectl
+  # port-forward` and point `base_url` at the local end so everything downstream (the Req
+  # client, health check, SSE loop) is untouched.
+  defp reachable_base_url(worker_host, server_url, context, port_forward_fun) when is_binary(worker_host) do
+    case Config.worker_mode() do
+      :kubernetes ->
+        with {:ok, remote_port} <- extract_server_port(server_url, context),
+             {:ok, port_forward, local_port} <- port_forward_fun.(worker_host, remote_port, context) do
+          {:ok, "http://127.0.0.1:#{local_port}", port_forward}
+        else
+          {:error, reason} -> {:error, port_forward_error(context, worker_host, reason)}
+        end
+
+      _ ->
+        {:error,
+         opencode_error(
+           :remote_unreachable,
+           :server_startup,
+           "OpenCode over a remote worker is only supported in Kubernetes mode",
+           Map.put(context, :worker_host, worker_host)
+         )}
+    end
+  end
+
+  defp extract_server_port(server_url, context) do
+    case URI.parse(server_url) do
+      %URI{port: port} when is_integer(port) and port > 0 ->
+        {:ok, port}
+
+      _ ->
+        {:error,
+         opencode_error(
+           :server_url_unparsable,
+           :server_startup,
+           "OpenCode announced a listening URL without a usable port",
+           Map.put(context, :server_url, server_url)
+         )}
+    end
+  end
+
+  # `reachable_base_url` may hand back an already-shaped opencode_error (from
+  # `extract_server_port`); leave those untouched and only wrap raw PortForward reasons.
+  defp port_forward_error(_context, _worker_host, %{backend: "opencode"} = error), do: error
+
+  defp port_forward_error(context, worker_host, reason) do
+    opencode_error(
+      :port_forward_failed,
+      :server_startup,
+      "Could not open a kubectl port-forward to the runner pod",
+      Map.merge(context, %{
+        worker_host: worker_host,
+        cause: preview_value(reason),
+        hint: "Verify the runner pod is Ready and that kubectl can port-forward to it in this namespace."
+      })
+    )
+  end
+
+  defp stop_port_forward(nil), do: :ok
+  defp stop_port_forward(port_forward), do: PortForward.stop(port_forward)
 
   @spec run_turn(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run_turn(%{} = session, prompt, issue, opts \\ []) do
@@ -178,9 +280,12 @@ defmodule SymphonyElixir.OpenCode.AppServer do
   end
 
   @spec stop_session(session()) :: :ok
-  def stop_session(%{port: port}) when is_port(port) do
-    stop_port(port)
+  def stop_session(%{stream: %AgentStream{} = stream} = session) do
+    stop_port_forward(Map.get(session, :port_forward))
+    AgentStream.close(stream)
   end
+
+  def stop_session(_session), do: :ok
 
   defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
     case Config.validate_workspace_path(workspace) do
@@ -201,8 +306,20 @@ defmodule SymphonyElixir.OpenCode.AppServer do
     end
   end
 
-  defp validate_workspace_cwd(_workspace, worker_host) when is_binary(worker_host) do
-    {:error, {:opencode_local_only, worker_host}}
+  # The workspace lives inside the pod, not on the orchestrator, so validate the path shape
+  # without `Path.expand`-ing it against the orchestrator's own filesystem.
+  defp validate_workspace_cwd(workspace, worker_host)
+       when is_binary(workspace) and is_binary(worker_host) do
+    cond do
+      String.trim(workspace) == "" ->
+        {:error, {:invalid_workspace_cwd, :empty_remote_workspace, worker_host}}
+
+      String.contains?(workspace, ["\n", "\r", <<0>>]) ->
+        {:error, {:invalid_workspace_cwd, :invalid_remote_workspace, worker_host, workspace}}
+
+      true ->
+        {:ok, workspace}
+    end
   end
 
   defp start_port(workspace, nil, command, issue) do
@@ -211,26 +328,36 @@ defmodule SymphonyElixir.OpenCode.AppServer do
     if is_nil(executable) do
       {:error, :bash_not_found}
     else
-      {:ok,
-       Port.open(
-         {:spawn_executable, String.to_charlist(executable)},
-         [
-           :binary,
-           :exit_status,
-           :stderr_to_stdout,
-           args: [~c"-lc", String.to_charlist(command)],
-           env: port_environment(issue),
-           cd: String.to_charlist(workspace),
-           line: @port_line_bytes
-         ]
-       )}
+      port =
+        Port.open(
+          {:spawn_executable, String.to_charlist(executable)},
+          [
+            :binary,
+            :exit_status,
+            :stderr_to_stdout,
+            args: [~c"-lc", String.to_charlist(command)],
+            env: port_environment(issue),
+            cd: String.to_charlist(workspace),
+            line: @port_line_bytes
+          ]
+        )
+
+      {:ok, AgentStream.from_port(port)}
     end
   end
 
-  defp start_port(_workspace, worker_host, _command, _issue) when is_binary(worker_host) do
-    {:error, {:opencode_local_only, worker_host}}
+  defp start_port(workspace, worker_host, command, _issue) when is_binary(worker_host) do
+    Remote.open_agent_stream(worker_host, remote_launch_command(workspace, command), line: @port_line_bytes)
   end
 
+  defp remote_launch_command(workspace, command) when is_binary(workspace) and is_binary(command) do
+    "cd #{shell_escape(workspace)} && exec #{command}"
+  end
+
+  # Local path only. In Kubernetes the runner pod already has these secrets, sourced from a
+  # mounted Secret by `/etc/profile.d/symphony-env.sh` on every `bash -lc` login shell, so
+  # the remote launch command (`remote_launch_command/2`) deliberately injects no env — it
+  # would be redundant to send the pod's own secrets back over the wire.
   defp port_environment(issue) do
     settings = Config.settings!()
     tracker = settings.tracker
@@ -283,9 +410,9 @@ defmodule SymphonyElixir.OpenCode.AppServer do
     |> compact_details()
   end
 
-  defp port_metadata(port) when is_port(port) do
-    case :erlang.port_info(port, :os_pid) do
-      {:os_pid, os_pid} ->
+  defp port_metadata(%AgentStream{} = stream) do
+    case AgentStream.os_pid(stream) do
+      os_pid when is_integer(os_pid) ->
         %{agent_server_pid: to_string(os_pid)}
 
       _ ->
@@ -293,34 +420,31 @@ defmodule SymphonyElixir.OpenCode.AppServer do
     end
   end
 
-  defp await_server_url(port, context, pending_line) when is_port(port) do
+  # Both transports funnel into the same handlers: real port messages (local) and
+  # broker-forwarded `{:agent_stream, ref, ...}` frames (Kubernetes). Exactly one of
+  # `stream.port` / `stream.ref` is non-nil, so the other set of clauses never matches.
+  defp await_server_url(%AgentStream{} = stream, context, pending_line) do
+    port = stream.port
+    ref = stream.ref
+
     receive do
       {^port, {:data, {:eol, chunk}}} ->
-        complete_line = pending_line <> IO.chardata_to_string(chunk)
-
-        case parse_listening_url(complete_line) do
-          {:ok, url} ->
-            {:ok, url}
-
-          :nomatch ->
-            log_port_output("server startup", complete_line)
-            await_server_url(port, context, "")
-        end
+        on_startup_line(stream, context, pending_line, chunk)
 
       {^port, {:data, {:noeol, chunk}}} ->
-        await_server_url(port, context, pending_line <> IO.chardata_to_string(chunk))
+        await_server_url(stream, context, pending_line <> IO.chardata_to_string(chunk))
 
       {^port, {:exit_status, status}} ->
-        {:error,
-         opencode_error(
-           :server_start_port_exit,
-           :server_startup,
-           "OpenCode exited before announcing its listening URL",
-           Map.merge(context, %{
-             exit_status: status,
-             hint: "Check the OpenCode startup output above for config or provider errors."
-           })
-         )}
+        {:error, server_start_exit_error(context, status)}
+
+      {:agent_stream, ^ref, {:data, {:eol, chunk}}} ->
+        on_startup_line(stream, context, pending_line, chunk)
+
+      {:agent_stream, ^ref, {:data, {:noeol, chunk}}} ->
+        await_server_url(stream, context, pending_line <> IO.chardata_to_string(chunk))
+
+      {:agent_stream, ^ref, {:exit_status, status}} ->
+        {:error, server_start_exit_error(context, status)}
     after
       Map.fetch!(context, :read_timeout_ms) ->
         {:error,
@@ -335,6 +459,31 @@ defmodule SymphonyElixir.OpenCode.AppServer do
            )
          )}
     end
+  end
+
+  defp on_startup_line(stream, context, pending_line, chunk) do
+    complete_line = pending_line <> IO.chardata_to_string(chunk)
+
+    case parse_listening_url(complete_line) do
+      {:ok, url} ->
+        {:ok, url}
+
+      :nomatch ->
+        log_port_output("server startup", complete_line)
+        await_server_url(stream, context, "")
+    end
+  end
+
+  defp server_start_exit_error(context, status) do
+    opencode_error(
+      :server_start_port_exit,
+      :server_startup,
+      "OpenCode exited before announcing its listening URL",
+      Map.merge(context, %{
+        exit_status: status,
+        hint: "Check the OpenCode startup output above for config or provider errors."
+      })
+    )
   end
 
   defp parse_listening_url(line) when is_binary(line) do
@@ -479,6 +628,12 @@ defmodule SymphonyElixir.OpenCode.AppServer do
          turn_timeout_ms,
          stall_timeout_ms
        ) do
+    # See `await_server_url/3`: exactly one of `stream.port` / `stream.ref` is non-nil, and
+    # `port_forward` is nil in local mode — so the unused clauses never match a real message.
+    stream_port = session.stream.port
+    stream_ref = session.stream.ref
+    port_forward = session.port_forward
+
     receive do
       {^turn_ref, :activity, activity_ms} ->
         await_turn_result(
@@ -546,7 +701,7 @@ defmodule SymphonyElixir.OpenCode.AppServer do
           stall_timeout_ms
         )
 
-      {port, {:data, {:eol, chunk}}} when port == session.port ->
+      {^stream_port, {:data, {:eol, chunk}}} ->
         log_port_output("server", IO.chardata_to_string(chunk))
 
         await_turn_result(
@@ -560,7 +715,7 @@ defmodule SymphonyElixir.OpenCode.AppServer do
           stall_timeout_ms
         )
 
-      {port, {:data, {:noeol, chunk}}} when port == session.port ->
+      {^stream_port, {:data, {:noeol, chunk}}} ->
         log_port_output("server", IO.chardata_to_string(chunk))
 
         await_turn_result(
@@ -574,15 +729,77 @@ defmodule SymphonyElixir.OpenCode.AppServer do
           stall_timeout_ms
         )
 
-      {port, {:exit_status, status}} when port == session.port ->
+      {^stream_port, {:exit_status, status}} ->
+        {:error, server_turn_exit_error(session, status)}
+
+      {:agent_stream, ^stream_ref, {:data, {:eol, chunk}}} ->
+        log_port_output("server", IO.chardata_to_string(chunk))
+
+        await_turn_result(
+          session,
+          turn_ref,
+          message_task,
+          listener_task,
+          started_at_ms,
+          last_activity_ms,
+          turn_timeout_ms,
+          stall_timeout_ms
+        )
+
+      {:agent_stream, ^stream_ref, {:data, {:noeol, chunk}}} ->
+        log_port_output("server", IO.chardata_to_string(chunk))
+
+        await_turn_result(
+          session,
+          turn_ref,
+          message_task,
+          listener_task,
+          started_at_ms,
+          last_activity_ms,
+          turn_timeout_ms,
+          stall_timeout_ms
+        )
+
+      {:agent_stream, ^stream_ref, {:exit_status, status}} ->
+        {:error, server_turn_exit_error(session, status)}
+
+      {^port_forward, {:data, {:eol, chunk}}} ->
+        log_port_output("port-forward", IO.chardata_to_string(chunk))
+
+        await_turn_result(
+          session,
+          turn_ref,
+          message_task,
+          listener_task,
+          started_at_ms,
+          last_activity_ms,
+          turn_timeout_ms,
+          stall_timeout_ms
+        )
+
+      {^port_forward, {:data, {:noeol, chunk}}} ->
+        log_port_output("port-forward", IO.chardata_to_string(chunk))
+
+        await_turn_result(
+          session,
+          turn_ref,
+          message_task,
+          listener_task,
+          started_at_ms,
+          last_activity_ms,
+          turn_timeout_ms,
+          stall_timeout_ms
+        )
+
+      {^port_forward, {:exit_status, status}} ->
         {:error,
          opencode_error(
-           :port_exit,
+           :port_forward_exit,
            :turn_runtime,
-           "OpenCode server exited while the turn was still in progress",
+           "The kubectl port-forward to the runner pod exited while the turn was still in progress",
            Map.merge(session_context(session), %{
              exit_status: status,
-             hint: "Check the OpenCode server output above for the process exit reason."
+             hint: "The runner pod likely disappeared (e.g. a spot-node preemption); the run fails rather than hanging."
            })
          )}
     after
@@ -1003,12 +1220,20 @@ defmodule SymphonyElixir.OpenCode.AppServer do
 
   defp resolve_timeout_reason(timeout_reason), do: timeout_reason
 
-  defp stop_port(port) when is_port(port) do
-    Port.close(port)
-    :ok
-  rescue
-    _error ->
-      :ok
+  defp server_turn_exit_error(session, status) do
+    opencode_error(
+      :port_exit,
+      :turn_runtime,
+      "OpenCode server exited while the turn was still in progress",
+      Map.merge(session_context(session), %{
+        exit_status: status,
+        hint: "Check the OpenCode server output above for the process exit reason."
+      })
+    )
+  end
+
+  defp shell_escape(value) when is_binary(value) do
+    "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
   end
 
   defp log_port_output(stream_label, line) when is_binary(line) do

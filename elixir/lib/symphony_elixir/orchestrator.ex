@@ -1363,16 +1363,11 @@ defmodule SymphonyElixir.Orchestrator do
     Map.put(running_entry, key, value)
   end
 
-  defp select_worker_host(%State{} = state, preferred_worker_host, backend, issue \\ nil) do
-    cond do
-      AgentRoute.local_only_backend?(backend || Config.agent_backend()) ->
-        nil
-
-      Config.worker_mode() == :kubernetes ->
-        select_kubernetes_worker_host(state, preferred_worker_host, issue)
-
-      true ->
-        select_ssh_worker_host(state, preferred_worker_host)
+  defp select_worker_host(%State{} = state, preferred_worker_host, _backend, issue \\ nil) do
+    if Config.worker_mode() == :kubernetes do
+      select_kubernetes_worker_host(state, preferred_worker_host, issue)
+    else
+      select_ssh_worker_host(state, preferred_worker_host)
     end
   end
 

@@ -3,6 +3,10 @@ defmodule SymphonyElixir.AppServerTest do
 
   import Plug.Conn
 
+  alias SymphonyElixir.AgentStream
+  alias SymphonyElixir.K8s.{Broker, Protocol}
+  alias SymphonyElixir.OpenCode.AppServer, as: OpenCodeAppServer
+
   defmodule FakeOpenCodeState do
     use Agent
 
@@ -737,6 +741,248 @@ defmodule SymphonyElixir.AppServerTest do
       assert_receive {:fake_opencode_request, {:abort, "session-test", %{}}}, 1_000
     after
       File.rm_rf(test_root)
+    end
+  end
+
+  test "opencode local mode spawns a local port stream and completes a session" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-opencode-local-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-LOCAL")
+      File.mkdir_p!(workspace)
+
+      server = start_fake_opencode_server!({:success, workspace})
+      launcher = write_launcher_script!(test_root, server.base_url)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        opencode_command: launcher
+      )
+
+      assert {:ok, session} = OpenCodeAppServer.start_session(workspace)
+
+      try do
+        # worker_host nil => a real local port stream, no port-forward.
+        assert %AgentStream{mode: :port} = session.stream
+        assert session.port_forward == nil
+        assert session.base_url == server.base_url
+
+        assert {:ok, result} =
+                 OpenCodeAppServer.run_turn(session, "Ship it", issue_fixture("issue-local", "MT-LOCAL", "Local"))
+
+        assert result.session_id == "session-test"
+      after
+        OpenCodeAppServer.stop_session(session)
+      end
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "opencode kubernetes mode starts a session over the broker and forwards base_url to a local port" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-opencode-k8s-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-K8S")
+      File.mkdir_p!(workspace)
+
+      # The server the Req client actually talks to; its port is what the port-forward binds.
+      server = start_fake_opencode_server!({:success, workspace})
+      local_port = uri_port!(server.base_url)
+
+      # The launcher announces the *pod-local* URL, which is unreachable from the orchestrator.
+      pod_url = "http://127.0.0.1:59999"
+      launcher = write_launcher_script!(test_root, pod_url)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        opencode_command: launcher,
+        worker_mode: "kubernetes",
+        worker_kubernetes: kubernetes_settings()
+      )
+
+      pod = "symphony-pod-#{System.unique_integer([:positive])}"
+      start_reader_broker(pod)
+
+      parent = self()
+      {port_forward_fun, forward_port} = fake_port_forward(parent, local_port)
+
+      assert {:ok, session} =
+               OpenCodeAppServer.start_session(workspace,
+                 worker_host: pod,
+                 port_forward_fun: port_forward_fun
+               )
+
+      try do
+        # The stream comes from the broker, and base_url points at the forwarded local port,
+        # not at the pod's own (59999) — proving the rewrite.
+        assert %AgentStream{mode: :broker} = session.stream
+        assert session.port_forward == forward_port
+        assert session.base_url == "http://127.0.0.1:#{local_port}"
+        refute session.base_url =~ "59999"
+
+        # The port-forward was opened against the port the pod actually announced.
+        assert_receive {:fake_port_forward, ^pod, 59_999}, 1_000
+
+        assert {:ok, result} =
+                 OpenCodeAppServer.run_turn(session, "Ship it", issue_fixture("issue-k8s", "MT-K8S", "K8s"))
+
+        assert result.session_id == "session-test"
+      after
+        OpenCodeAppServer.stop_session(session)
+      end
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "opencode kubernetes mode tears the port-forward down with the session" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-opencode-k8s-teardown-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-K8S-TD")
+      File.mkdir_p!(workspace)
+
+      server = start_fake_opencode_server!({:success, workspace})
+      local_port = uri_port!(server.base_url)
+      launcher = write_launcher_script!(test_root, "http://127.0.0.1:59999")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        opencode_command: launcher,
+        worker_mode: "kubernetes",
+        worker_kubernetes: kubernetes_settings()
+      )
+
+      pod = "symphony-pod-#{System.unique_integer([:positive])}"
+      start_reader_broker(pod)
+
+      {port_forward_fun, forward_port} = fake_port_forward(self(), local_port)
+
+      assert {:ok, session} =
+               OpenCodeAppServer.start_session(workspace,
+                 worker_host: pod,
+                 port_forward_fun: port_forward_fun
+               )
+
+      assert Port.info(forward_port) != nil
+      assert :ok = OpenCodeAppServer.stop_session(session)
+      wait_for_port_closed!(forward_port)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "opencode kubernetes mode tears the port-forward down when start_session fails after it opens" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-opencode-k8s-fail-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-K8S-FAIL")
+      File.mkdir_p!(workspace)
+
+      launcher = write_launcher_script!(test_root, "http://127.0.0.1:59999")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        opencode_command: launcher,
+        worker_mode: "kubernetes",
+        worker_kubernetes: kubernetes_settings(),
+        # Small timeout so the health check against the dead local port fails fast.
+        opencode_read_timeout_ms: 300
+      )
+
+      pod = "symphony-pod-#{System.unique_integer([:positive])}"
+      start_reader_broker(pod)
+
+      # Forward to a port with no server behind it, so the handshake bails after start_port
+      # (and the port-forward) already succeeded.
+      {port_forward_fun, forward_port} = fake_port_forward(self(), 1)
+
+      assert {:error, _reason} =
+               OpenCodeAppServer.start_session(workspace,
+                 worker_host: pod,
+                 port_forward_fun: port_forward_fun
+               )
+
+      wait_for_port_closed!(forward_port)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  defp kubernetes_settings do
+    %{
+      namespace: "symphony-test",
+      container: "runner",
+      pod_template: %{
+        "spec" => %{"containers" => [%{"name" => "runner", "image" => "ghcr.io/org/runner:latest"}]}
+      }
+    }
+  end
+
+  # Drives a broker against a local bash process running the real protocol reader, so the
+  # whole broker transport is exercised without a cluster or kubectl.
+  defp start_reader_broker(pod) do
+    bash = System.find_executable("bash")
+    {:ok, broker} = Broker.start_link(name: pod, executable: bash, args: ["-c", Protocol.reader_script()])
+    on_exit(fn -> if Process.alive?(broker), do: Process.exit(broker, :kill) end)
+    broker
+  end
+
+  # A stand-in for `PortForward.start/3`: opens a real, long-lived port (so teardown is
+  # observable) and reports the local port the caller should dial — the fake fake-opencode
+  # server's port, so the rewritten base_url is reachable.
+  defp fake_port_forward(parent, local_port) do
+    bash = System.find_executable("bash")
+
+    forward_port =
+      Port.open(
+        {:spawn_executable, String.to_charlist(bash)},
+        [:binary, :exit_status, args: [~c"-c", ~c"while true; do sleep 1; done"]]
+      )
+
+    fun = fn pod, remote_port, _context ->
+      send(parent, {:fake_port_forward, pod, remote_port})
+      {:ok, forward_port, local_port}
+    end
+
+    {fun, forward_port}
+  end
+
+  defp uri_port!(url) do
+    %URI{port: port} = URI.parse(url)
+    port
+  end
+
+  defp wait_for_port_closed!(port, attempts \\ 80)
+  defp wait_for_port_closed!(_port, 0), do: flunk("timed out waiting for port to close")
+
+  defp wait_for_port_closed!(port, attempts) do
+    if :erlang.port_info(port) == :undefined do
+      :ok
+    else
+      Process.sleep(25)
+      wait_for_port_closed!(port, attempts - 1)
     end
   end
 

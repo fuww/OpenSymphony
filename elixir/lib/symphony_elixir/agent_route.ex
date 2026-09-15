@@ -117,10 +117,6 @@ defmodule SymphonyElixir.AgentRoute do
   @spec effort_values() :: [String.t()]
   def effort_values, do: @effort_values
 
-  @spec local_only_backend?(String.t() | nil) :: boolean()
-  def local_only_backend?("opencode"), do: true
-  def local_only_backend?(_backend), do: false
-
   # Codex natively supports low/medium/high/xhigh. Symphony's "max" tier is above
   # xhigh but Codex has no higher level, so both "max" and "xhigh" collapse to xhigh.
   @spec codex_effort(String.t() | nil) :: String.t() | nil

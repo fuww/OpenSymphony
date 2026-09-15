@@ -1165,7 +1165,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), worker_max_concurrent_agents_per_host: 2)
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
-    assert message =~ "OpenCode v1 is local-only"
+    assert message =~ "OpenCode does not support `worker.max_concurrent_agents_per_host`"
     assert message =~ "worker.max_concurrent_agents_per_host"
   end
 
@@ -1481,17 +1481,17 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
-  test "config validation rejects local-only ssh worker settings only for opencode" do
+  test "config validation rejects ssh worker settings only for opencode" do
     write_workflow_file!(Workflow.workflow_file_path(), worker_ssh_hosts: ["worker-01"])
 
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
-    assert message =~ "OpenCode v1 is local-only"
+    assert message =~ "OpenCode does not support SSH workers"
     assert message =~ "worker.ssh_hosts"
 
     write_workflow_file!(Workflow.workflow_file_path(), worker_max_concurrent_agents_per_host: 2)
 
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
-    assert message =~ "OpenCode v1 is local-only"
+    assert message =~ "OpenCode does not support `worker.max_concurrent_agents_per_host`"
     assert message =~ "worker.max_concurrent_agents_per_host"
 
     write_workflow_file!(Workflow.workflow_file_path(),
@@ -1566,7 +1566,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert message =~ "cannot be combined with `worker.ssh_hosts`"
   end
 
-  test "kubernetes worker mode is rejected for the local-only opencode backend" do
+  test "kubernetes worker mode is accepted for the opencode backend" do
     write_workflow_file!(Workflow.workflow_file_path(),
       agent_backend: "opencode",
       worker_mode: "kubernetes",
@@ -1576,8 +1576,19 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       }
     )
 
+    assert :ok = Config.validate!()
+    assert Config.agent_backend() == "opencode"
+    assert Config.worker_mode() == :kubernetes
+  end
+
+  test "ssh worker mode is still rejected for the opencode backend" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_backend: "opencode",
+      worker_ssh_hosts: ["worker-01"]
+    )
+
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
-    assert message =~ "OpenCode v1 is local-only"
+    assert message =~ "OpenCode does not support SSH workers"
   end
 
   test "config runtime helpers preserve existing behavior when default effort is unset" do
