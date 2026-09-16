@@ -238,7 +238,11 @@ defmodule SymphonyElixir.AppServerTest do
       json(conn, 200, %{"info" => %{"id" => "assistant-message-5", "sessionID" => session_id}})
     end
 
-    defp handle_scenario(:message_post_timeout, conn, state, session_id) do
+    # Holds POST /session/:id/message open well past `read_timeout_ms` while streaming SSE
+    # activity the whole time, then answers 200 — the shape of a real turn that runs for
+    # minutes. The turn POST must survive on the stall/turn watchdogs rather than being severed
+    # by Req's `receive_timeout`.
+    defp handle_scenario(:slow_turn_with_activity, conn, state, session_id) do
       Enum.each(1..10, fn step ->
         FakeOpenCodeState.broadcast(state, "message.part.delta", %{
           "part" => %{
@@ -251,7 +255,14 @@ defmodule SymphonyElixir.AppServerTest do
         Process.sleep(100)
       end)
 
-      json(conn, 200, %{"info" => %{"id" => "assistant-message-6", "sessionID" => session_id}})
+      json(conn, 200, %{
+        "id" => "assistant-message-6",
+        "info" => %{
+          "id" => "assistant-message-6",
+          "sessionID" => session_id,
+          "tokens" => %{"input" => 9, "output" => 5, "reasoning" => 2}
+        }
+      })
     end
 
     defp wait_for_permission_reply(state, session_id, permission_id, response) do
@@ -653,11 +664,11 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "app server returns actionable timeout details when posting a turn message times out" do
+  test "app server survives a turn whose message POST outlives read_timeout_ms while streaming activity" do
     test_root =
       Path.join(
         System.tmp_dir!(),
-        "symphony-elixir-opencode-message-timeout-#{System.unique_integer([:positive])}"
+        "symphony-elixir-opencode-slow-turn-#{System.unique_integer([:positive])}"
       )
 
     try do
@@ -665,48 +676,43 @@ defmodule SymphonyElixir.AppServerTest do
       workspace = Path.join(workspace_root, "MT-105")
       File.mkdir_p!(workspace)
 
-      server = start_fake_opencode_server!(:message_post_timeout)
+      server = start_fake_opencode_server!(:slow_turn_with_activity)
       launcher = write_launcher_script!(test_root, server.base_url)
       parent = self()
 
+      # The turn POST is held open ~1s — twice `read_timeout_ms` — so a shared receive_timeout
+      # would sever it as `:message_post_timeout`. The generous stall/turn budgets are never hit
+      # because SSE activity keeps flowing, so the turn is expected to complete normally.
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         opencode_command: launcher,
         opencode_read_timeout_ms: 500,
-        opencode_stall_timeout_ms: 5_000
+        opencode_stall_timeout_ms: 5_000,
+        opencode_turn_timeout_ms: 10_000
       )
 
-      assert {:error,
-              %{
-                kind: :message_post_timeout,
-                phase: :post_turn_message,
-                session_id: "session-test",
-                read_timeout_ms: 500,
-                method: "POST",
-                path: "/session/session-test/message",
-                message: message,
-                hint: hint
-              }} =
+      assert {:ok, result} =
                AppServer.run(
                  workspace,
-                 "Wait too long",
-                 issue_fixture("issue-message-timeout", "MT-105", "Message timeout"),
+                 "Take your time",
+                 issue_fixture("issue-slow-turn", "MT-105", "Slow turn"),
                  on_message: &send(parent, {:agent_message, &1})
                )
 
-      assert message =~ "OpenCode did not respond to POST /session/session-test/message"
-      assert hint =~ "Increase opencode.read_timeout_ms"
+      assert result.session_id == "session-test"
+      assert result.turn_id == "assistant-message-6"
 
       assert_receive {:fake_opencode_request, {:message_post, "session-test", _body}}, 1_000
       assert_receive {:agent_message, %{event: :turn_started, session_id: "session-test"}}, 1_000
-      assert_receive {:agent_message, %{event: "message.part.delta"}}, 1_000
+      assert_receive {:agent_message, %{event: "message.part.delta"}}, 2_000
 
       assert_receive {:agent_message,
                       %{
-                        event: :turn_ended_with_error,
-                        reason: %{kind: :message_post_timeout, message: ^message}
+                        event: :turn_completed,
+                        session_id: "session-test",
+                        usage: %{input: 9, output: 5, reasoning: 2, total: 16}
                       }},
-                     1_000
+                     2_000
     after
       File.rm_rf(test_root)
     end

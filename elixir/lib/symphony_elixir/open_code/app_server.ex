@@ -570,9 +570,16 @@ defmodule SymphonyElixir.OpenCode.AppServer do
       |> maybe_put_model(session.model)
       |> maybe_put_variant(session.variant)
 
+    # The shared `session.request` carries `receive_timeout: read_timeout_ms` (5s), which suits
+    # the short calls (health, session create, abort, permission replies) that answer at once.
+    # This POST is different: it does not return until the whole assistant turn finishes, which
+    # is minutes on a real ticket. Override it to `turn_timeout_ms` so Req does not sever the
+    # request seconds after the prompt is posted; `await_turn_result/8` remains the real
+    # watchdog for this call via `stall_timeout_ms` and `turn_timeout_ms`.
     case Req.post(session.request,
            url: path,
-           json: payload
+           json: payload,
+           receive_timeout: session.turn_timeout_ms
          ) do
       {:ok, %{status: status, body: body}} when status in 200..299 and is_map(body) ->
         {:ok, body}
