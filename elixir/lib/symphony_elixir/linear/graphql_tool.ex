@@ -167,11 +167,13 @@ defmodule SymphonyElixir.Linear.GraphqlTool do
     const ENDPOINT = process.env.SYMPHONY_LINEAR_ENDPOINT || "https://api.linear.app/graphql";
     const API_KEY = process.env.SYMPHONY_LINEAR_API_KEY;
 
+    // MCP stdio transport: one JSON-RPC message per line, no embedded newlines,
+    // in both directions. LSP-style byte-length headers are not MCP framing and
+    // never match a client's newline-delimited `initialize`.
     let buffer = "";
 
     function send(message) {
-      const payload = JSON.stringify(message);
-      process.stdout.write(`Content-Length: ${Buffer.byteLength(payload, "utf8")}\\r\\n\\r\\n${payload}`);
+      process.stdout.write(`${JSON.stringify(message)}\\n`);
     }
 
     function sendResult(id, result) {
@@ -344,54 +346,37 @@ defmodule SymphonyElixir.Linear.GraphqlTool do
       }
     }
 
+    function dispatch(line) {
+      let message;
+
+      try {
+        message = JSON.parse(line);
+      } catch (error) {
+        sendError(null, -32700, "Parse error", { reason: String(error) });
+        return;
+      }
+
+      Promise.resolve(handleMessage(message)).catch((error) => {
+        if (message?.id !== null && message?.id !== undefined) {
+          sendError(message.id, -32603, "Internal error", { reason: String(error) });
+        }
+      });
+    }
+
     function readMessages() {
       while (true) {
-        const headerEnd = buffer.indexOf("\\r\\n\\r\\n");
+        const newline = buffer.indexOf("\\n");
 
-        if (headerEnd === -1) {
+        if (newline === -1) {
           return;
         }
 
-        const header = buffer.slice(0, headerEnd);
-        const contentLengthLine = header
-          .split("\\r\\n")
-          .find((line) => line.toLowerCase().startsWith("content-length:"));
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
 
-        if (!contentLengthLine) {
-          buffer = "";
-          return;
+        if (line) {
+          dispatch(line);
         }
-
-        const contentLength = Number(contentLengthLine.split(":")[1]?.trim() || "");
-
-        if (!Number.isFinite(contentLength) || contentLength < 0) {
-          buffer = "";
-          return;
-        }
-
-        const bodyStart = headerEnd + 4;
-
-        if (buffer.length < bodyStart + contentLength) {
-          return;
-        }
-
-        const body = buffer.slice(bodyStart, bodyStart + contentLength);
-        buffer = buffer.slice(bodyStart + contentLength);
-
-        let message;
-
-        try {
-          message = JSON.parse(body);
-        } catch (error) {
-          sendError(null, -32700, "Parse error", { reason: String(error) });
-          continue;
-        }
-
-        Promise.resolve(handleMessage(message)).catch((error) => {
-          if (message?.id !== null && message?.id !== undefined) {
-            sendError(message.id, -32603, "Internal error", { reason: String(error) });
-          }
-        });
       }
     }
 
@@ -400,7 +385,16 @@ defmodule SymphonyElixir.Linear.GraphqlTool do
       buffer += chunk;
       readMessages();
     });
-    process.stdin.on("end", () => process.exit(0));
+    process.stdin.on("end", () => {
+      const rest = buffer.trim();
+      buffer = "";
+
+      if (rest) {
+        dispatch(rest);
+      }
+
+      process.exit(0);
+    });
     process.stdin.resume();
     """
   end
