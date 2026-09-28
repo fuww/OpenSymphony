@@ -1198,6 +1198,12 @@ Optional client-side tool extension:
   - invalid input, missing auth, or transport failure -> `success=false` with an error payload
 - Return the GraphQL response or error payload as structured tool output that the model can inspect
   in-session.
+- Implementations may retry a Linear rate-limit rejection (GraphQL error code `RATELIMITED`, sent
+  as HTTP 400 without `Retry-After`) after a bounded wait derived from
+  `x-ratelimit-requests-reset`, and may answer a repeated read (same query document and variables,
+  no intervening mutation) from a per-session cache. Neither changes the result semantics above;
+  errors that waiting cannot fix must not be retried, and a rate-limit retry must not be sent
+  before the advertised reset.
 
 Illustrative responses (equivalent payload shapes are acceptable if they preserve the same outcome):
 

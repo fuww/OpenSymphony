@@ -358,6 +358,20 @@ even though the endpoint works from your local browser.
 
 - Supports local runs and SSH worker hosts.
 - Boots a workspace-local MCP server so repo skills can talk to Linear safely during agent runs.
+- That MCP server (`.symphony/claude/linear_graphql_mcp.js`) shares one Linear request budget
+  with every other session using the same API key, so it waits out a `RATELIMITED` rejection
+  (detected from the GraphQL `errors[].extensions.code`, since Linear answers HTTP 400 rather than
+  429) until `x-ratelimit-requests-reset`, never less than `SYMPHONY_LINEAR_MIN_BACKOFF_MS` (1000),
+  for up to `SYMPHONY_LINEAR_MAX_RETRIES` (4) attempts. A reset further out than
+  `SYMPHONY_LINEAR_MAX_BACKOFF_MS` (900000) is returned at once with the budget it saw rather than
+  retried early, because a retry sent before the reset is rejected again and spends another request;
+  without a reset header the wait grows exponentially from the floor up to that cap. Errors that
+  waiting cannot fix are returned on the first attempt. Repeat `query` documents with
+  the same variables are answered from a per-run cache for `SYMPHONY_LINEAR_CACHE_TTL_MS` (300000,
+  `0` disables); any mutation flushes it and failed reads are never stored. Every response logs
+  `x-ratelimit-requests-remaining` to stderr and to `SYMPHONY_LINEAR_LOG_PATH` (defaults to
+  `.symphony/claude/linear_graphql.log`, empty disables). The variables are read from the agent
+  process environment, so on a Kubernetes worker set them on the runner pod.
 - Uses `claude.command`, optional `claude.model`, and `claude.permission_mode`.
 
 ### OpenCode

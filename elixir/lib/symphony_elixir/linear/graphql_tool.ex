@@ -154,6 +154,11 @@ defmodule SymphonyElixir.Linear.GraphqlTool do
 
     """
     #!/usr/bin/env node
+    // The nearest package.json decides whether node treats this file as CommonJS
+    // or ESM, so neither `require` nor `import` can be assumed. Built-ins are
+    // resolved through whichever loader exists; without one, file logging is off.
+    const fs = loadBuiltin("node:fs");
+    const path = loadBuiltin("node:path");
     const TOOL_NAME = #{inspect(tool_name())};
     const DESCRIPTION = #{inspect(description())};
     const INPUT_SCHEMA = #{Jason.encode!(input_schema())};
@@ -166,8 +171,163 @@ defmodule SymphonyElixir.Linear.GraphqlTool do
     const HTTP_FAILURE_PREFIX = #{inspect(http_failure_prefix)};
     const ENDPOINT = process.env.SYMPHONY_LINEAR_ENDPOINT || "https://api.linear.app/graphql";
     const API_KEY = process.env.SYMPHONY_LINEAR_API_KEY;
+    // Linear's request budget is per user, so every session running under one
+    // API key shares the same pool. The shim therefore backs off on a rate-limit
+    // rejection, serves repeat reads from a per-run cache and logs the remaining
+    // budget on every response. The bounds are tunable through the environment.
+    const MIN_BACKOFF_MS = readInt(process.env.SYMPHONY_LINEAR_MIN_BACKOFF_MS, 1000, 1);
+    const MAX_BACKOFF_MS = Math.max(MIN_BACKOFF_MS, readInt(process.env.SYMPHONY_LINEAR_MAX_BACKOFF_MS, 900000, 1));
+    const MAX_RETRIES = readInt(process.env.SYMPHONY_LINEAR_MAX_RETRIES, 4, 0);
+    const CACHE_TTL_MS = readInt(process.env.SYMPHONY_LINEAR_CACHE_TTL_MS, 300000, 0);
+    const LOG_PATH =
+      process.env.SYMPHONY_LINEAR_LOG_PATH === undefined
+        ? defaultLogPath()
+        : process.env.SYMPHONY_LINEAR_LOG_PATH;
+    // Linear signals exhaustion as HTTP 400 with this GraphQL error code (not
+    // 429, and without Retry-After); x-ratelimit-requests-reset (epoch ms) says
+    // when the budget refills.
+    const RATE_LIMIT_ERROR_CODE = "RATELIMITED";
+    const RESET_HEADER = "x-ratelimit-requests-reset";
+    const REMAINING_HEADER = "x-ratelimit-requests-remaining";
+    const LIMIT_HEADER = "x-ratelimit-requests-limit";
+    const OPERATION_TOKEN = /\\b(query|mutation|subscription|fragment)\\b|[{}]/g;
 
+    const cache = new Map();
     let buffer = "";
+
+    function loadBuiltin(name) {
+      if (typeof require === "function") {
+        return require(name);
+      }
+
+      if (typeof process.getBuiltinModule === "function") {
+        return process.getBuiltinModule(name);
+      }
+
+      return null;
+    }
+
+    function defaultLogPath() {
+      const script = process.argv[1];
+
+      if (!path || typeof script !== "string" || script === "") {
+        return "";
+      }
+
+      return path.join(path.dirname(script), "linear_graphql.log");
+    }
+
+    function readInt(raw, fallback, minimum) {
+      const value = Number.parseInt(raw ?? "", 10);
+      return Number.isFinite(value) && value >= minimum ? value : fallback;
+    }
+
+    function log(fields) {
+      const line = `${new Date().toISOString()} linear_graphql ${fields}\\n`;
+      process.stderr.write(line);
+
+      if (LOG_PATH && fs) {
+        try {
+          fs.appendFileSync(LOG_PATH, line);
+        } catch (_error) {
+          // Logging must never fail a request.
+        }
+      }
+    }
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    // Classifies the document by its first top-level definition. Fragments may
+    // precede the operation; an anonymous selection set is a query.
+    function operationType(query) {
+      const source = query.replace(/#[^\\n\\r]*/g, "");
+      let depth = 0;
+      let inFragment = false;
+
+      for (const match of source.matchAll(OPERATION_TOKEN)) {
+        const token = match[0];
+
+        if (token === "{") {
+          if (depth === 0 && !inFragment) {
+            return "query";
+          }
+
+          depth += 1;
+        } else if (token === "}") {
+          depth = Math.max(0, depth - 1);
+          inFragment = inFragment && depth > 0;
+        } else if (depth === 0) {
+          if (token !== "fragment") {
+            return token;
+          }
+
+          inFragment = true;
+        }
+      }
+
+      return "unknown";
+    }
+
+    function stableStringify(value) {
+      if (Array.isArray(value)) {
+        return `[${value.map(stableStringify).join(",")}]`;
+      }
+
+      if (value && typeof value === "object") {
+        const entries = Object.keys(value)
+          .sort()
+          .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`);
+        return `{${entries.join(",")}}`;
+      }
+
+      return JSON.stringify(value) ?? "null";
+    }
+
+    function rateLimited(response, payload) {
+      if (response.status === 429) {
+        return true;
+      }
+
+      const errors = Array.isArray(payload?.errors) ? payload.errors : [];
+
+      return errors.some(
+        (entry) =>
+          entry !== null &&
+          typeof entry === "object" &&
+          entry.extensions !== null &&
+          typeof entry.extensions === "object" &&
+          entry.extensions.code === RATE_LIMIT_ERROR_CODE,
+      );
+    }
+
+    function readBudget(response) {
+      const reset = Number.parseInt(response.headers.get(RESET_HEADER) ?? "", 10);
+
+      return {
+        remaining: response.headers.get(REMAINING_HEADER) ?? "unknown",
+        limit: response.headers.get(LIMIT_HEADER) ?? "unknown",
+        resetAt: Number.isFinite(reset) && reset > 0 ? reset : null,
+      };
+    }
+
+    // Wait until the budget resets, never less than the floor, with a little
+    // jitter so ten sessions do not retry in lockstep. Without a usable reset
+    // header fall back to exponential growth from the floor, capped. A reset
+    // further out than the cap returns null: a retry sent before the reset is
+    // rejected again and only spends more of the shared budget.
+    function backoffMs(resetAt, attempt) {
+      const wanted = resetAt === null ? MIN_BACKOFF_MS * 2 ** attempt : resetAt - Date.now();
+
+      if (resetAt !== null && wanted > MAX_BACKOFF_MS) {
+        return null;
+      }
+
+      const bounded = Math.min(MAX_BACKOFF_MS, Math.max(MIN_BACKOFF_MS, wanted));
+      const jitter = Math.floor(Math.random() * Math.max(1, Math.floor(bounded / 10)));
+      return Math.min(MAX_BACKOFF_MS, bounded + jitter);
+    }
 
     function send(message) {
       const payload = JSON.stringify(message);
@@ -248,43 +408,113 @@ defmodule SymphonyElixir.Linear.GraphqlTool do
         return failureResponse(parseJson(MISSING_API_KEY_PAYLOAD, { error: { message: "Missing API key" } }));
       }
 
-      try {
-        const response = await fetch(ENDPOINT, {
-          method: "POST",
-          headers: {
-            Authorization: API_KEY,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            query: normalized.query,
-            variables: normalized.variables,
-          }),
-        });
+      const operation = operationType(normalized.query);
+      const cacheable = operation === "query" && CACHE_TTL_MS > 0;
+      const key = cacheable ? stableStringify([normalized.query, normalized.variables]) : null;
 
-        const payload = await response.json();
+      if (cacheable) {
+        const entry = cache.get(key);
+
+        if (entry && entry.expiresAt > Date.now()) {
+          log(`cache=hit op=${operation} age_ms=${Date.now() - entry.storedAt}`);
+          return successResponse(entry.payload);
+        }
+
+        cache.delete(key);
+      }
+
+      if (operation !== "query") {
+        // Anything that may write invalidates every cached read.
+        cache.clear();
+      }
+
+      const outcome = await requestWithBackoff(normalized, operation);
+
+      if (outcome.ok && cacheable) {
+        const now = Date.now();
+        cache.set(key, { payload: outcome.payload, storedAt: now, expiresAt: now + CACHE_TTL_MS });
+      }
+
+      return outcome.ok ? successResponse(outcome.payload) : failureResponse(outcome.payload);
+    }
+
+    async function requestWithBackoff(normalized, operation) {
+      for (let attempt = 0; ; attempt += 1) {
+        let response;
+        let payload;
+
+        try {
+          response = await fetch(ENDPOINT, {
+            method: "POST",
+            headers: {
+              Authorization: API_KEY,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              query: normalized.query,
+              variables: normalized.variables,
+            }),
+          });
+
+          payload = await response.json();
+        } catch (error) {
+          return {
+            ok: false,
+            payload: {
+              error: {
+                message: TRANSPORT_FAILURE_MESSAGE,
+                reason: error instanceof Error ? error.message : String(error),
+              },
+            },
+          };
+        }
+
+        const budget = readBudget(response);
+        const limited = rateLimited(response, payload);
+        const resetIn = budget.resetAt === null ? "unknown" : Math.max(0, budget.resetAt - Date.now());
+
+        log(
+          `budget remaining=${budget.remaining} limit=${budget.limit} reset_in_ms=${resetIn} ` +
+            `status=${response.status} op=${operation} attempt=${attempt + 1} ratelimited=${limited}`,
+        );
+
+        if (limited && attempt < MAX_RETRIES) {
+          const waitMs = backoffMs(budget.resetAt, attempt);
+
+          if (waitMs === null) {
+            log(`ratelimited reset_beyond_cap reset_in_ms=${resetIn} max_backoff_ms=${MAX_BACKOFF_MS}`);
+          } else {
+            log(`ratelimited retry=${attempt + 1}/${MAX_RETRIES} wait_ms=${waitMs}`);
+            await sleep(waitMs);
+            continue;
+          }
+        }
+
+        // Only a rate-limit rejection is retried: an auth, validation or
+        // server error replayed after a wait just spends more of the budget.
+        const rateLimit = limited
+          ? { attempts: attempt + 1, remaining: budget.remaining, limit: budget.limit, resetAt: budget.resetAt }
+          : null;
 
         if (!response.ok) {
-          return failureResponse({
-            error: {
-              message: `${HTTP_FAILURE_PREFIX}${response.status}.`,
-              status: response.status,
-              body: payload,
+          return {
+            ok: false,
+            payload: {
+              error: {
+                message: `${HTTP_FAILURE_PREFIX}${response.status}.`,
+                status: response.status,
+                body: payload,
+                ...(rateLimit ? { rateLimit } : {}),
+              },
             },
-          });
+          };
         }
 
         if (Array.isArray(payload?.errors) && payload.errors.length > 0) {
-          return failureResponse(payload);
+          return { ok: false, payload: rateLimit ? { ...payload, rateLimit } : payload };
         }
 
-        return successResponse(payload);
-      } catch (error) {
-        return failureResponse({
-          error: {
-            message: TRANSPORT_FAILURE_MESSAGE,
-            reason: error instanceof Error ? error.message : String(error),
-          },
-        });
+        return { ok: true, payload };
       }
     }
 
