@@ -142,13 +142,14 @@ defmodule SymphonyElixir.Workspace do
 
   def remove_issue_workspaces(issue_or_identifier, nil) do
     issue_context = issue_context(issue_or_identifier)
-    settings = settings_for_cleanup(issue_or_identifier)
+    settings = Config.settings!()
 
     case settings.worker.ssh_hosts do
       [] ->
         issue_context
         |> workspace_paths_for_issue_context(settings)
-        |> Enum.each(&remove(&1, nil, settings: settings, issue_or_identifier: issue_or_identifier))
+        |> Enum.filter(&File.exists?/1)
+        |> remove_local_issue_workspaces(issue_or_identifier)
 
       worker_hosts ->
         Enum.each(worker_hosts, &remove_issue_workspaces(issue_or_identifier, &1))
@@ -159,6 +160,17 @@ defmodule SymphonyElixir.Workspace do
 
   def remove_issue_workspaces(_identifier, _worker_host) do
     :ok
+  end
+
+  # Per-issue settings only add the project workflow's hooks, but resolving them
+  # syncs the route's repo cache (fetch, checkout, reset). Boot cleanup walks every
+  # terminal issue and almost none still has a workspace, so resolve only when
+  # there is one to remove; workspace paths come from the global settings either way.
+  defp remove_local_issue_workspaces([], _issue_or_identifier), do: :ok
+
+  defp remove_local_issue_workspaces(workspaces, issue_or_identifier) do
+    settings = settings_for_cleanup(issue_or_identifier)
+    Enum.each(workspaces, &remove(&1, nil, settings: settings, issue_or_identifier: issue_or_identifier))
   end
 
   @spec preflight_repo_setup(Schema.t()) :: :ok | {:error, term()}
