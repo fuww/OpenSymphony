@@ -199,6 +199,74 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "preflight with except: only syncs routes whose preflight inputs changed" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-preflight-changed-routes-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      repo_a = Path.join(test_root, "repos/a")
+      repo_b = Path.join(test_root, "repos/b")
+      config_path = Path.join(test_root, "symphony.yml")
+
+      for repo <- [repo_a, repo_b] do
+        init_repo!(repo, "initial\n")
+        write_project_workflow_repo_file!(repo, "WORKFLOW.md")
+      end
+
+      project_b = %{
+        linear_project: "project-b",
+        repo: "./repos/b",
+        workflow: "WORKFLOW.md",
+        workspace_root: "./workspaces/b"
+      }
+
+      projects = [
+        %{linear_project: "project-a", repo: "./repos/a", workflow: "WORKFLOW.md", workspace_root: "./workspaces/a"},
+        project_b
+      ]
+
+      write_symphony_config_file!(config_path, workspace_root: Path.join(test_root, "workspaces"), projects: projects)
+      SymphonyConfig.set_config_file_path(config_path)
+
+      settings = Config.settings!()
+      assert :ok = Workspace.preflight_repo_setup(settings)
+      previous_targets = Workspace.preflight_targets(settings)
+
+      for repo <- [repo_a, repo_b] do
+        File.write!(Path.join(repo, "README.md"), "updated upstream\n")
+        System.cmd("git", ["-C", repo, "commit", "-am", "update upstream"])
+      end
+
+      # A hot reload that only adds a Linear project to route b.
+      write_symphony_config_file!(config_path,
+        workspace_root: Path.join(test_root, "workspaces"),
+        projects: [
+          Enum.at(projects, 0),
+          project_b |> Map.delete(:linear_project) |> Map.put(:linear_projects, ["project-b", "project-c"])
+        ]
+      )
+
+      new_settings = Config.settings!()
+      assert :ok = Workspace.preflight_repo_setup(new_settings, except: previous_targets)
+
+      [cache_a, cache_b] =
+        for {repo, root} <- [{repo_a, "workspaces/a"}, {repo_b, "workspaces/b"}] do
+          Path.join([test_root, root, ".symphony-cache", Config.repo_source(repo).cache_key])
+        end
+
+      assert File.read!(Path.join(cache_a, "README.md")) == "initial\n"
+      assert File.read!(Path.join(cache_b, "README.md")) == "updated upstream\n"
+
+      assert :ok = Workspace.preflight_repo_setup(new_settings, except: Workspace.preflight_targets(new_settings))
+      assert File.read!(Path.join(cache_a, "README.md")) == "initial\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "terminal cleanup only resolves the project workflow for issues that still have a workspace" do
     test_root =
       Path.join(
