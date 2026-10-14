@@ -199,6 +199,49 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "terminal cleanup only resolves the project workflow for issues that still have a workspace" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-cleanup-no-workspace-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      repo_root = Path.join(test_root, "repos/product")
+      config_path = Path.join(test_root, "symphony.yml")
+      workspace_root = Path.join(test_root, "workspaces")
+      before_remove_marker = Path.join(test_root, "before_remove.log")
+
+      init_repo!(repo_root, "product repo\n")
+
+      write_project_workflow_repo_file!(repo_root, "WORKFLOW.md",
+        hook_before_remove: "echo before_remove >> \"#{before_remove_marker}\""
+      )
+
+      write_symphony_config_file!(config_path,
+        workspace_root: workspace_root,
+        projects: [%{linear_project: "project-a", repo: "./repos/product", workflow: "WORKFLOW.md"}]
+      )
+
+      SymphonyConfig.set_config_file_path(config_path)
+
+      # Resolving the project workflow clones and syncs the route's repo cache, which
+      # boot cleanup used to pay for every terminal issue, almost none of which still
+      # has a workspace.
+      gone = %Issue{id: "issue-gone", identifier: "PI-404", project_slug: "project-a"}
+      assert :ok = Workspace.remove_issue_workspaces(gone)
+      refute File.exists?(Path.join(workspace_root, ".symphony-cache"))
+
+      done = %Issue{id: "issue-done", identifier: "PI-1", project_slug: "project-a"}
+      assert {:ok, workspace} = Workspace.create_for_issue(done)
+      assert :ok = Workspace.remove_issue_workspaces(done)
+      refute File.exists?(workspace)
+      assert File.read!(before_remove_marker) == "before_remove\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workspace path is deterministic per issue identifier" do
     workspace_root =
       Path.join(
