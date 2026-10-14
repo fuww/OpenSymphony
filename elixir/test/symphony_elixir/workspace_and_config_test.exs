@@ -199,6 +199,117 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "preflight with except: only syncs routes whose preflight inputs changed" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-preflight-changed-routes-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      repo_a = Path.join(test_root, "repos/a")
+      repo_b = Path.join(test_root, "repos/b")
+      config_path = Path.join(test_root, "symphony.yml")
+
+      for repo <- [repo_a, repo_b] do
+        init_repo!(repo, "initial\n")
+        write_project_workflow_repo_file!(repo, "WORKFLOW.md")
+      end
+
+      project_b = %{
+        linear_project: "project-b",
+        repo: "./repos/b",
+        workflow: "WORKFLOW.md",
+        workspace_root: "./workspaces/b"
+      }
+
+      projects = [
+        %{linear_project: "project-a", repo: "./repos/a", workflow: "WORKFLOW.md", workspace_root: "./workspaces/a"},
+        project_b
+      ]
+
+      write_symphony_config_file!(config_path, workspace_root: Path.join(test_root, "workspaces"), projects: projects)
+      SymphonyConfig.set_config_file_path(config_path)
+
+      settings = Config.settings!()
+      assert :ok = Workspace.preflight_repo_setup(settings)
+      previous_targets = Workspace.preflight_targets(settings)
+
+      for repo <- [repo_a, repo_b] do
+        File.write!(Path.join(repo, "README.md"), "updated upstream\n")
+        System.cmd("git", ["-C", repo, "commit", "-am", "update upstream"])
+      end
+
+      # A hot reload that only adds a Linear project to route b.
+      write_symphony_config_file!(config_path,
+        workspace_root: Path.join(test_root, "workspaces"),
+        projects: [
+          Enum.at(projects, 0),
+          project_b |> Map.delete(:linear_project) |> Map.put(:linear_projects, ["project-b", "project-c"])
+        ]
+      )
+
+      new_settings = Config.settings!()
+      assert :ok = Workspace.preflight_repo_setup(new_settings, except: previous_targets)
+
+      [cache_a, cache_b] =
+        for {repo, root} <- [{repo_a, "workspaces/a"}, {repo_b, "workspaces/b"}] do
+          Path.join([test_root, root, ".symphony-cache", Config.repo_source(repo).cache_key])
+        end
+
+      assert File.read!(Path.join(cache_a, "README.md")) == "initial\n"
+      assert File.read!(Path.join(cache_b, "README.md")) == "updated upstream\n"
+
+      assert :ok = Workspace.preflight_repo_setup(new_settings, except: Workspace.preflight_targets(new_settings))
+      assert File.read!(Path.join(cache_a, "README.md")) == "initial\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "terminal cleanup only resolves the project workflow for issues that still have a workspace" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-cleanup-no-workspace-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      repo_root = Path.join(test_root, "repos/product")
+      config_path = Path.join(test_root, "symphony.yml")
+      workspace_root = Path.join(test_root, "workspaces")
+      before_remove_marker = Path.join(test_root, "before_remove.log")
+
+      init_repo!(repo_root, "product repo\n")
+
+      write_project_workflow_repo_file!(repo_root, "WORKFLOW.md",
+        hook_before_remove: "echo before_remove >> \"#{before_remove_marker}\""
+      )
+
+      write_symphony_config_file!(config_path,
+        workspace_root: workspace_root,
+        projects: [%{linear_project: "project-a", repo: "./repos/product", workflow: "WORKFLOW.md"}]
+      )
+
+      SymphonyConfig.set_config_file_path(config_path)
+
+      # Resolving the project workflow clones and syncs the route's repo cache, which
+      # boot cleanup used to pay for every terminal issue, almost none of which still
+      # has a workspace.
+      gone = %Issue{id: "issue-gone", identifier: "PI-404", project_slug: "project-a"}
+      assert :ok = Workspace.remove_issue_workspaces(gone)
+      refute File.exists?(Path.join(workspace_root, ".symphony-cache"))
+
+      done = %Issue{id: "issue-done", identifier: "PI-1", project_slug: "project-a"}
+      assert {:ok, workspace} = Workspace.create_for_issue(done)
+      assert :ok = Workspace.remove_issue_workspaces(done)
+      refute File.exists?(workspace)
+      assert File.read!(before_remove_marker) == "before_remove\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workspace path is deterministic per issue identifier" do
     workspace_root =
       Path.join(

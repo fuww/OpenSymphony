@@ -47,6 +47,7 @@ defmodule SymphonyElixir.Orchestrator do
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
+      preflight_targets: MapSet.new(),
       retry_attempts: %{},
       codex_totals: nil,
       codex_rate_limits: nil,
@@ -72,6 +73,7 @@ defmodule SymphonyElixir.Orchestrator do
         poll_interval_ms: config.polling.interval_ms,
         max_concurrent_agents: config.agent.max_concurrent_agents,
         config_fingerprint: config_fingerprint(config),
+        preflight_targets: Workspace.preflight_targets(config),
         next_poll_due_at_ms: now_ms,
         poll_check_in_progress: false,
         tick_timer_ref: nil,
@@ -1947,15 +1949,22 @@ defmodule SymphonyElixir.Orchestrator do
     config = Config.validated_settings!()
     config_fingerprint = config_fingerprint(config)
 
-    if state.config_fingerprint != config_fingerprint do
-      :ok = Workspace.preflight_repo_setup!(config)
-    end
+    # Preflight blocks this process, so a hot reload re-syncs only the routes it
+    # changed instead of every routed repo cache.
+    preflight_targets =
+      if state.config_fingerprint != config_fingerprint do
+        :ok = Workspace.preflight_repo_setup!(config, except: state.preflight_targets)
+        Workspace.preflight_targets(config)
+      else
+        state.preflight_targets
+      end
 
     %{
       state
       | poll_interval_ms: config.polling.interval_ms,
         max_concurrent_agents: config.agent.max_concurrent_agents,
-        config_fingerprint: config_fingerprint
+        config_fingerprint: config_fingerprint,
+        preflight_targets: preflight_targets
     }
   end
 

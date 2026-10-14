@@ -142,13 +142,14 @@ defmodule SymphonyElixir.Workspace do
 
   def remove_issue_workspaces(issue_or_identifier, nil) do
     issue_context = issue_context(issue_or_identifier)
-    settings = settings_for_cleanup(issue_or_identifier)
+    settings = Config.settings!()
 
     case settings.worker.ssh_hosts do
       [] ->
         issue_context
         |> workspace_paths_for_issue_context(settings)
-        |> Enum.each(&remove(&1, nil, settings: settings, issue_or_identifier: issue_or_identifier))
+        |> Enum.filter(&File.exists?/1)
+        |> remove_local_issue_workspaces(issue_or_identifier)
 
       worker_hosts ->
         Enum.each(worker_hosts, &remove_issue_workspaces(issue_or_identifier, &1))
@@ -161,18 +162,55 @@ defmodule SymphonyElixir.Workspace do
     :ok
   end
 
-  @spec preflight_repo_setup(Schema.t()) :: :ok | {:error, term()}
-  def preflight_repo_setup(%Schema{} = settings) do
-    worker_hosts = [nil | List.wrap(settings.worker.ssh_hosts)] |> Enum.uniq()
+  # Per-issue settings only add the project workflow's hooks, but resolving them
+  # syncs the route's repo cache (fetch, checkout, reset). Boot cleanup walks every
+  # terminal issue and almost none still has a workspace, so resolve only when
+  # there is one to remove; workspace paths come from the global settings either way.
+  defp remove_local_issue_workspaces([], _issue_or_identifier), do: :ok
+
+  defp remove_local_issue_workspaces(workspaces, issue_or_identifier) do
+    settings = settings_for_cleanup(issue_or_identifier)
+    Enum.each(workspaces, &remove(&1, nil, settings: settings, issue_or_identifier: issue_or_identifier))
+  end
+
+  @doc """
+  Syncs every routed repo cache and validates its project workflow.
+
+  `except:` takes a set from `preflight_targets/1` and skips the routes whose
+  preflight inputs are unchanged, so a config hot reload only pays for the
+  routes it actually touched.
+  """
+  @spec preflight_repo_setup(Schema.t(), keyword()) :: :ok | {:error, term()}
+  def preflight_repo_setup(%Schema{} = settings, opts \\ []) do
+    worker_hosts = preflight_worker_hosts(settings)
+    unchanged = Keyword.get(opts, :except, MapSet.new())
 
     settings
     |> Config.linear_project_routes()
+    |> Enum.reject(&MapSet.member?(unchanged, preflight_target(&1, worker_hosts, settings)))
     |> Enum.reduce_while(:ok, fn route, :ok ->
       case preflight_route(route, worker_hosts, settings) do
         :ok -> {:cont, :ok}
         {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
+  end
+
+  @spec preflight_targets(Schema.t()) :: MapSet.t()
+  def preflight_targets(%Schema{} = settings) do
+    worker_hosts = preflight_worker_hosts(settings)
+
+    settings
+    |> Config.linear_project_routes()
+    |> MapSet.new(&preflight_target(&1, worker_hosts, settings))
+  end
+
+  defp preflight_worker_hosts(settings), do: [nil | List.wrap(settings.worker.ssh_hosts)] |> Enum.uniq()
+
+  # Everything a route's preflight reads: the route (repo, branch, workflow), where
+  # its cache lives, which can shift when routes are added, and the hosts holding one.
+  defp preflight_target(route, worker_hosts, settings) do
+    {route, Config.workspace_root_for_route(route, settings), worker_hosts}
   end
 
   defp preflight_route(route, worker_hosts, settings) do
@@ -238,9 +276,9 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  @spec preflight_repo_setup!(Schema.t()) :: :ok
-  def preflight_repo_setup!(%Schema{} = settings) do
-    case preflight_repo_setup(settings) do
+  @spec preflight_repo_setup!(Schema.t(), keyword()) :: :ok
+  def preflight_repo_setup!(%Schema{} = settings, opts \\ []) do
+    case preflight_repo_setup(settings, opts) do
       :ok ->
         :ok
 
