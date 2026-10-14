@@ -173,18 +173,44 @@ defmodule SymphonyElixir.Workspace do
     Enum.each(workspaces, &remove(&1, nil, settings: settings, issue_or_identifier: issue_or_identifier))
   end
 
-  @spec preflight_repo_setup(Schema.t()) :: :ok | {:error, term()}
-  def preflight_repo_setup(%Schema{} = settings) do
-    worker_hosts = [nil | List.wrap(settings.worker.ssh_hosts)] |> Enum.uniq()
+  @doc """
+  Syncs every routed repo cache and validates its project workflow.
+
+  `except:` takes a set from `preflight_targets/1` and skips the routes whose
+  preflight inputs are unchanged, so a config hot reload only pays for the
+  routes it actually touched.
+  """
+  @spec preflight_repo_setup(Schema.t(), keyword()) :: :ok | {:error, term()}
+  def preflight_repo_setup(%Schema{} = settings, opts \\ []) do
+    worker_hosts = preflight_worker_hosts(settings)
+    unchanged = Keyword.get(opts, :except, MapSet.new())
 
     settings
     |> Config.linear_project_routes()
+    |> Enum.reject(&MapSet.member?(unchanged, preflight_target(&1, worker_hosts, settings)))
     |> Enum.reduce_while(:ok, fn route, :ok ->
       case preflight_route(route, worker_hosts, settings) do
         :ok -> {:cont, :ok}
         {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
+  end
+
+  @spec preflight_targets(Schema.t()) :: MapSet.t()
+  def preflight_targets(%Schema{} = settings) do
+    worker_hosts = preflight_worker_hosts(settings)
+
+    settings
+    |> Config.linear_project_routes()
+    |> MapSet.new(&preflight_target(&1, worker_hosts, settings))
+  end
+
+  defp preflight_worker_hosts(settings), do: [nil | List.wrap(settings.worker.ssh_hosts)] |> Enum.uniq()
+
+  # Everything a route's preflight reads: the route (repo, branch, workflow), where
+  # its cache lives, which can shift when routes are added, and the hosts holding one.
+  defp preflight_target(route, worker_hosts, settings) do
+    {route, Config.workspace_root_for_route(route, settings), worker_hosts}
   end
 
   defp preflight_route(route, worker_hosts, settings) do
@@ -250,9 +276,9 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  @spec preflight_repo_setup!(Schema.t()) :: :ok
-  def preflight_repo_setup!(%Schema{} = settings) do
-    case preflight_repo_setup(settings) do
+  @spec preflight_repo_setup!(Schema.t(), keyword()) :: :ok
+  def preflight_repo_setup!(%Schema{} = settings, opts \\ []) do
+    case preflight_repo_setup(settings, opts) do
       :ok ->
         :ok
 
