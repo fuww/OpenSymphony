@@ -24,6 +24,19 @@ defmodule SymphonyElixir.Linear.GraphqlTool do
     }
   }
 
+  # The Claude MCP shim caches reads per run. A write made through another Linear
+  # tool never reaches the shim, so the agent is told how to see past the cache.
+  @claude_cache_description """
+  Repeat reads of the same query and variables within a run may be answered from a short-lived cache; \
+  such a reply carries `extensions.symphonyCache` with the entry's age. A mutation sent through this tool \
+  clears the cache, but a write made through any other Linear tool does not: pass `fresh: true` to \
+  re-read from Linear after one.
+  """
+  @claude_fresh_property %{
+    "type" => "boolean",
+    "description" => "Skip the per-run read cache and fetch from Linear. Use after writing through another Linear tool."
+  }
+
   @spec tool_name() :: String.t()
   def tool_name, do: @tool_name
 
@@ -154,9 +167,14 @@ defmodule SymphonyElixir.Linear.GraphqlTool do
 
     """
     #!/usr/bin/env node
+    // The nearest package.json decides whether node treats this file as CommonJS
+    // or ESM, so neither `require` nor `import` can be assumed. Built-ins are
+    // resolved through whichever loader exists; without one, file logging is off.
+    const fs = loadBuiltin("node:fs");
+    const path = loadBuiltin("node:path");
     const TOOL_NAME = #{inspect(tool_name())};
-    const DESCRIPTION = #{inspect(description())};
-    const INPUT_SCHEMA = #{Jason.encode!(input_schema())};
+    const DESCRIPTION = #{inspect(String.trim(description()) <> " " <> String.trim(@claude_cache_description))};
+    const INPUT_SCHEMA = #{Jason.encode!(put_in(input_schema(), ["properties", "fresh"], @claude_fresh_property))};
     const MISSING_QUERY_PAYLOAD = #{inspect(missing_query)};
     const INVALID_ARGUMENTS_PAYLOAD = #{inspect(invalid_arguments)};
     const INVALID_VARIABLES_PAYLOAD = #{inspect(invalid_variables)};
@@ -166,11 +184,206 @@ defmodule SymphonyElixir.Linear.GraphqlTool do
     const HTTP_FAILURE_PREFIX = #{inspect(http_failure_prefix)};
     const ENDPOINT = process.env.SYMPHONY_LINEAR_ENDPOINT || "https://api.linear.app/graphql";
     const API_KEY = process.env.SYMPHONY_LINEAR_API_KEY;
+    // Linear's request budget is per user, so every session running under one
+    // API key shares the same pool. The shim therefore backs off on a rate-limit
+    // rejection, serves repeat reads from a per-run cache and logs the remaining
+    // budget on every response. The bounds are tunable through the environment.
+    const MIN_BACKOFF_MS = readInt(process.env.SYMPHONY_LINEAR_MIN_BACKOFF_MS, 1000, 1);
+    const MAX_BACKOFF_MS = Math.max(MIN_BACKOFF_MS, readInt(process.env.SYMPHONY_LINEAR_MAX_BACKOFF_MS, 900000, 1));
+    const MAX_RETRIES = readInt(process.env.SYMPHONY_LINEAR_MAX_RETRIES, 4, 0);
+    const CACHE_TTL_MS = readInt(process.env.SYMPHONY_LINEAR_CACHE_TTL_MS, 300000, 0);
+    const LOG_PATH =
+      process.env.SYMPHONY_LINEAR_LOG_PATH === undefined
+        ? defaultLogPath()
+        : process.env.SYMPHONY_LINEAR_LOG_PATH;
+    // Linear signals exhaustion as HTTP 400 with this GraphQL error code (not
+    // 429, and without Retry-After) for any of three buckets: the per-user
+    // request count, a per-endpoint request count and query complexity. Each
+    // has its own x-ratelimit-*-reset header (epoch ms) saying when it refills.
+    const RATE_LIMIT_ERROR_CODE = "RATELIMITED";
+    const REMAINING_HEADER = "x-ratelimit-requests-remaining";
+    const LIMIT_HEADER = "x-ratelimit-requests-limit";
+    const REQUEST_BUCKETS = ["x-ratelimit-requests", "x-ratelimit-endpoint-requests"];
+    const COMPLEXITY_BUCKET = "x-ratelimit-complexity";
+    const OPERATION_TOKEN = /\\b(query|mutation|subscription|fragment)\\b|[{}]/g;
 
+    const cache = new Map();
     // MCP stdio transport: one JSON-RPC message per line, no embedded newlines,
     // in both directions. LSP-style byte-length headers are not MCP framing and
     // never match a client's newline-delimited `initialize`.
     let buffer = "";
+
+    function loadBuiltin(name) {
+      if (typeof require === "function") {
+        return require(name);
+      }
+
+      if (typeof process.getBuiltinModule === "function") {
+        return process.getBuiltinModule(name);
+      }
+
+      return null;
+    }
+
+    function defaultLogPath() {
+      const script = process.argv[1];
+
+      if (!path || typeof script !== "string" || script === "") {
+        return "";
+      }
+
+      return path.join(path.dirname(script), "linear_graphql.log");
+    }
+
+    function readInt(raw, fallback, minimum) {
+      const value = Number.parseInt(raw ?? "", 10);
+      return Number.isFinite(value) && value >= minimum ? value : fallback;
+    }
+
+    function log(fields) {
+      const line = `${new Date().toISOString()} linear_graphql ${fields}\\n`;
+      process.stderr.write(line);
+
+      if (LOG_PATH && fs) {
+        try {
+          fs.appendFileSync(LOG_PATH, line);
+        } catch (_error) {
+          // Logging must never fail a request.
+        }
+      }
+    }
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    // Classifies the document by its first top-level definition. Fragments may
+    // precede the operation; an anonymous selection set is a query.
+    function operationType(query) {
+      const source = query.replace(/#[^\\n\\r]*/g, "");
+      let depth = 0;
+      let inFragment = false;
+
+      for (const match of source.matchAll(OPERATION_TOKEN)) {
+        const token = match[0];
+
+        if (token === "{") {
+          if (depth === 0 && !inFragment) {
+            return "query";
+          }
+
+          depth += 1;
+        } else if (token === "}") {
+          depth = Math.max(0, depth - 1);
+          inFragment = inFragment && depth > 0;
+        } else if (depth === 0) {
+          if (token !== "fragment") {
+            return token;
+          }
+
+          inFragment = true;
+        }
+      }
+
+      return "unknown";
+    }
+
+    function stableStringify(value) {
+      if (Array.isArray(value)) {
+        return `[${value.map(stableStringify).join(",")}]`;
+      }
+
+      if (value && typeof value === "object") {
+        const entries = Object.keys(value)
+          .sort()
+          .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`);
+        return `{${entries.join(",")}}`;
+      }
+
+      return JSON.stringify(value) ?? "null";
+    }
+
+    function rateLimited(response, payload) {
+      if (response.status === 429) {
+        return true;
+      }
+
+      const errors = Array.isArray(payload?.errors) ? payload.errors : [];
+
+      return errors.some(
+        (entry) =>
+          entry !== null &&
+          typeof entry === "object" &&
+          entry.extensions !== null &&
+          typeof entry.extensions === "object" &&
+          entry.extensions.code === RATE_LIMIT_ERROR_CODE,
+      );
+    }
+
+    function readHeaderInt(response, name) {
+      const value = Number.parseInt(response.headers.get(name) ?? "", 10);
+      return Number.isFinite(value) ? value : null;
+    }
+
+    function bucketReset(response, bucket) {
+      const reset = readHeaderInt(response, `${bucket}-reset`);
+      return reset !== null && reset > 0 ? reset : null;
+    }
+
+    // The reset to wait for is the one of the bucket that is spent. A request
+    // bucket at zero is spent; when several are, the later reset is the one that
+    // lets the request through. When no request bucket is at zero the rejection
+    // came from query complexity, whose remaining figure cannot be compared with
+    // the cost of a query the shim does not know, so its reset is used.
+    function exhaustedReset(response) {
+      const spent = REQUEST_BUCKETS.filter((bucket) => {
+        const remaining = readHeaderInt(response, `${bucket}-remaining`);
+        return remaining !== null && remaining <= 0;
+      })
+        .map((bucket) => bucketReset(response, bucket))
+        .filter((reset) => reset !== null);
+
+      if (spent.length > 0) {
+        return Math.max(...spent);
+      }
+
+      return bucketReset(response, COMPLEXITY_BUCKET) ?? bucketReset(response, REQUEST_BUCKETS[0]);
+    }
+
+    function readBudget(response) {
+      return {
+        remaining: response.headers.get(REMAINING_HEADER) ?? "unknown",
+        limit: response.headers.get(LIMIT_HEADER) ?? "unknown",
+        resetAt: exhaustedReset(response),
+      };
+    }
+
+    // Linear may answer with partial `data` next to its errors. A mutation that
+    // returned any data may already have run some of its fields, so it is never
+    // replayed; one rejected before execution carries no data and is safe to retry.
+    function replayable(operation, payload) {
+      return operation === "query" || payload?.data === undefined || payload?.data === null;
+    }
+
+    // Wait until the budget resets, never less than the floor, with a little
+    // jitter so concurrent sessions do not retry in lockstep. Without a usable
+    // reset header fall back to exponential growth from the floor. The cap bounds
+    // the sleep of the whole call, not of one retry: claude hears nothing while
+    // the shim waits, so its stall watchdog has to outlast the sum. A wait that
+    // does not fit in what is left of the cap returns null: a retry sent before
+    // the reset is rejected again and only spends more of the shared budget.
+    function backoffMs(resetAt, attempt, waitedMs) {
+      const left = MAX_BACKOFF_MS - waitedMs;
+      const wanted = resetAt === null ? MIN_BACKOFF_MS * 2 ** attempt : resetAt - Date.now();
+      const bounded = Math.max(MIN_BACKOFF_MS, wanted);
+
+      if (bounded > left) {
+        return null;
+      }
+
+      const jitter = Math.floor(Math.random() * Math.max(1, Math.floor(bounded / 10)));
+      return Math.min(left, bounded + jitter);
+    }
 
     function send(message) {
       process.stdout.write(`${JSON.stringify(message)}\\n`);
@@ -213,7 +426,7 @@ defmodule SymphonyElixir.Linear.GraphqlTool do
           return { ok: false, payload: parseJson(MISSING_QUERY_PAYLOAD, { error: { message: "Missing query" } }) };
         }
 
-        return { ok: true, query, variables: {} };
+        return { ok: true, query, variables: {}, fresh: false };
       }
 
       if (!args || typeof args !== "object" || Array.isArray(args)) {
@@ -227,16 +440,17 @@ defmodule SymphonyElixir.Linear.GraphqlTool do
       }
 
       const variables = args.variables ?? {};
+      const fresh = args.fresh === true;
 
       if (variables === null) {
-        return { ok: true, query, variables: {} };
+        return { ok: true, query, variables: {}, fresh };
       }
 
       if (typeof variables !== "object" || Array.isArray(variables)) {
         return { ok: false, payload: parseJson(INVALID_VARIABLES_PAYLOAD, { error: { message: "Invalid variables" } }) };
       }
 
-      return { ok: true, query, variables };
+      return { ok: true, query, variables, fresh };
     }
 
     async function executeTool(args) {
@@ -250,43 +464,125 @@ defmodule SymphonyElixir.Linear.GraphqlTool do
         return failureResponse(parseJson(MISSING_API_KEY_PAYLOAD, { error: { message: "Missing API key" } }));
       }
 
-      try {
-        const response = await fetch(ENDPOINT, {
-          method: "POST",
-          headers: {
-            Authorization: API_KEY,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            query: normalized.query,
-            variables: normalized.variables,
-          }),
-        });
+      const operation = operationType(normalized.query);
+      const cacheable = operation === "query" && CACHE_TTL_MS > 0;
+      const key = cacheable ? stableStringify([normalized.query, normalized.variables]) : null;
 
-        const payload = await response.json();
+      if (cacheable) {
+        const entry = cache.get(key);
+
+        if (entry && entry.expiresAt > Date.now() && !normalized.fresh) {
+          const ageMs = Date.now() - entry.storedAt;
+          log(`cache=hit op=${operation} age_ms=${ageMs}`);
+          // GraphQL reserves `extensions` for exactly this kind of side channel,
+          // so the marker leaves `data` untouched.
+          const extensions = { ...(entry.payload?.extensions ?? {}), symphonyCache: { hit: true, ageMs } };
+          return successResponse({ ...entry.payload, extensions });
+        }
+
+        cache.delete(key);
+      }
+
+      if (operation !== "query") {
+        // Anything that may write invalidates every cached read.
+        cache.clear();
+      }
+
+      const outcome = await requestWithBackoff(normalized, operation);
+
+      if (outcome.ok && cacheable) {
+        const now = Date.now();
+        cache.set(key, { payload: outcome.payload, storedAt: now, expiresAt: now + CACHE_TTL_MS });
+      }
+
+      return outcome.ok ? successResponse(outcome.payload) : failureResponse(outcome.payload);
+    }
+
+    async function requestWithBackoff(normalized, operation) {
+      let waitedMs = 0;
+
+      for (let attempt = 0; ; attempt += 1) {
+        let response;
+        let payload;
+
+        try {
+          response = await fetch(ENDPOINT, {
+            method: "POST",
+            headers: {
+              Authorization: API_KEY,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              query: normalized.query,
+              variables: normalized.variables,
+            }),
+          });
+
+          payload = await response.json();
+        } catch (error) {
+          return {
+            ok: false,
+            payload: {
+              error: {
+                message: TRANSPORT_FAILURE_MESSAGE,
+                reason: error instanceof Error ? error.message : String(error),
+              },
+            },
+          };
+        }
+
+        const budget = readBudget(response);
+        const limited = rateLimited(response, payload);
+        const resetIn = budget.resetAt === null ? "unknown" : Math.max(0, budget.resetAt - Date.now());
+
+        log(
+          `budget remaining=${budget.remaining} limit=${budget.limit} reset_in_ms=${resetIn} ` +
+            `status=${response.status} op=${operation} attempt=${attempt + 1} ratelimited=${limited}`,
+        );
+
+        if (limited && attempt < MAX_RETRIES && !replayable(operation, payload)) {
+          log(`ratelimited partial_mutation op=${operation} not_replayed`);
+        } else if (limited && attempt < MAX_RETRIES) {
+          const waitMs = backoffMs(budget.resetAt, attempt, waitedMs);
+
+          if (waitMs === null) {
+            log(
+              `ratelimited reset_beyond_cap reset_in_ms=${resetIn} waited_ms=${waitedMs} ` +
+                `max_backoff_ms=${MAX_BACKOFF_MS}`,
+            );
+          } else {
+            log(`ratelimited retry=${attempt + 1}/${MAX_RETRIES} wait_ms=${waitMs}`);
+            await sleep(waitMs);
+            waitedMs += waitMs;
+            continue;
+          }
+        }
+
+        // Only a rate-limit rejection is retried: an auth, validation or
+        // server error replayed after a wait just spends more of the budget.
+        const rateLimit = limited
+          ? { attempts: attempt + 1, remaining: budget.remaining, limit: budget.limit, resetAt: budget.resetAt }
+          : null;
 
         if (!response.ok) {
-          return failureResponse({
-            error: {
-              message: `${HTTP_FAILURE_PREFIX}${response.status}.`,
-              status: response.status,
-              body: payload,
+          return {
+            ok: false,
+            payload: {
+              error: {
+                message: `${HTTP_FAILURE_PREFIX}${response.status}.`,
+                status: response.status,
+                body: payload,
+                ...(rateLimit ? { rateLimit } : {}),
+              },
             },
-          });
+          };
         }
 
         if (Array.isArray(payload?.errors) && payload.errors.length > 0) {
-          return failureResponse(payload);
+          return { ok: false, payload: rateLimit ? { ...payload, rateLimit } : payload };
         }
 
-        return successResponse(payload);
-      } catch (error) {
-        return failureResponse({
-          error: {
-            message: TRANSPORT_FAILURE_MESSAGE,
-            reason: error instanceof Error ? error.message : String(error),
-          },
-        });
+        return { ok: true, payload };
       }
     }
 
