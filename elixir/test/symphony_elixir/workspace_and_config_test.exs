@@ -574,6 +574,64 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute issue.assigned_to_worker
   end
 
+  test "linear client routes issues matching the assignee OR a configured label" do
+    raw_issue = fn assignee_id, labels ->
+      %{
+        "id" => "issue-#{assignee_id}",
+        "identifier" => "MT-100",
+        "title" => "Routing",
+        "state" => %{"name" => "Todo"},
+        "assignee" => assignee_id && %{"id" => assignee_id},
+        "labels" => %{"nodes" => labels}
+      }
+    end
+
+    agent_label = [%{"name" => " Symphony "}]
+    grouped_label = [%{"name" => "Yes", "parent" => %{"name" => "Agent"}}]
+
+    # Assigned to the agent user, no label.
+    assert Client.normalize_issue_for_test(raw_issue.("agent", []), "agent", ["symphony"]).assigned_to_worker
+
+    # Assigned to a developer, with the pickup label (case/whitespace-insensitive).
+    assert Client.normalize_issue_for_test(raw_issue.("dev", agent_label), "agent", ["SYMPHONY"]).assigned_to_worker
+
+    # Grouped labels match by `parent/child`.
+    assert Client.normalize_issue_for_test(raw_issue.("dev", grouped_label), "agent", ["agent/yes"]).assigned_to_worker
+
+    # Assigned to a developer, without the pickup label.
+    refute Client.normalize_issue_for_test(raw_issue.("dev", [%{"name" => "Backend"}]), "agent", ["symphony"]).assigned_to_worker
+
+    # Label-only routing (no assignee configured) still filters by label.
+    assert Client.normalize_issue_for_test(raw_issue.(nil, agent_label), nil, ["symphony"]).assigned_to_worker
+    refute Client.normalize_issue_for_test(raw_issue.("dev", []), nil, ["symphony"]).assigned_to_worker
+
+    # No routing filter at all keeps every issue.
+    assert Client.normalize_issue_for_test(raw_issue.("dev", []), nil, []).assigned_to_worker
+  end
+
+  test "assignee-only config routes exactly as before when no labels are configured" do
+    labelled_dev_issue = %{
+      "id" => "issue-dev",
+      "identifier" => "MT-101",
+      "title" => "Developer ticket",
+      "state" => %{"name" => "Todo"},
+      "assignee" => %{"id" => "dev"},
+      "labels" => %{"nodes" => [%{"name" => "Symphony"}]}
+    }
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_assignee: "agent")
+    assert Config.settings!().tracker.labels == []
+
+    refute Client.normalize_issue_for_test(labelled_dev_issue, "agent").assigned_to_worker
+    refute Client.normalize_issue_for_test(labelled_dev_issue, "agent", []).assigned_to_worker
+  end
+
+  test "tracker labels are normalized from config" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_labels: [" Symphony ", "symphony", "", "Agent/Yes"])
+
+    assert Config.settings!().tracker.labels == ["symphony", "agent/yes"]
+  end
+
   test "linear client pagination merge helper preserves issue ordering" do
     issue_page_1 = [
       %Issue{id: "issue-1", identifier: "MT-1"},

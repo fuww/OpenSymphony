@@ -152,6 +152,23 @@ You are working on a Linear issue {{ issue.identifier }}.
 Title: {{ issue.title }} Body: {{ issue.description }}
 ```
 
+Ticket pickup filter (optional). By default every active issue in the routed projects is picked
+up. Set `tracker.assignee` and/or `tracker.labels` to narrow this; an issue is picked up when it
+matches the assignee **or** carries any of the labels:
+
+```yaml
+tracker:
+  kind: linear
+  api_key: $LINEAR_API_KEY
+  assignee: me          # Linear user id, or `me` for the API key's user (env: LINEAR_ASSIGNEE)
+  labels:               # case-insensitive; grouped labels as `parent/child`
+    - symphony
+```
+
+With only `assignee` set, behavior is unchanged: only issues assigned to that user are picked up.
+With only `labels` set, any issue with a matching label is picked up regardless of assignee.
+Removing the label (or reassigning away from the agent) stops a running agent on the next poll.
+
 Multi-project routing example:
 
 ```yaml

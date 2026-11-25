@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Linear.Client do
 
   require Logger
   alias SymphonyElixir.{Config, Linear.Issue}
+  alias SymphonyElixir.Config.Schema
 
   @issue_page_size 50
   @max_error_body_log_bytes 1_000
@@ -139,7 +140,7 @@ defmodule SymphonyElixir.Linear.Client do
         {:error, :missing_linear_project_slug}
 
       true ->
-        with {:ok, assignee_filter} <- routing_assignee_filter() do
+        with {:ok, assignee_filter} <- routing_filter() do
           do_fetch_by_states(project_slugs, team_keys, tracker.active_states, assignee_filter)
         end
     end
@@ -188,7 +189,7 @@ defmodule SymphonyElixir.Linear.Client do
         {:ok, []}
 
       ids ->
-        with {:ok, assignee_filter} <- routing_assignee_filter() do
+        with {:ok, assignee_filter} <- routing_filter() do
           do_fetch_issue_states(ids, assignee_filter)
         end
     end
@@ -225,8 +226,8 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   @doc false
-  @spec normalize_issue_for_test(map(), String.t() | nil) :: Issue.t() | nil
-  def normalize_issue_for_test(issue, assignee) when is_map(issue) do
+  @spec normalize_issue_for_test(map(), String.t() | nil, [String.t()]) :: Issue.t() | nil
+  def normalize_issue_for_test(issue, assignee, labels \\ []) when is_map(issue) and is_list(labels) do
     assignee_filter =
       case assignee do
         value when is_binary(value) ->
@@ -239,7 +240,7 @@ defmodule SymphonyElixir.Linear.Client do
           nil
       end
 
-    normalize_issue(issue, assignee_filter)
+    normalize_issue(issue, build_routing_filter(assignee_filter, labels))
   end
 
   @doc false
@@ -482,6 +483,7 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp normalize_issue(issue, assignee_filter) when is_map(issue) do
     assignee = issue["assignee"]
+    labels = extract_labels(issue)
     project = issue["project"]
     team = issue["team"]
 
@@ -500,8 +502,8 @@ defmodule SymphonyElixir.Linear.Client do
       url: issue["url"],
       assignee_id: assignee_field(assignee, "id"),
       blocked_by: extract_blockers(issue),
-      labels: extract_labels(issue),
-      assigned_to_worker: assigned_to_worker?(assignee, assignee_filter),
+      labels: labels,
+      assigned_to_worker: assigned_to_worker?(assignee, labels, assignee_filter),
       created_at: parse_datetime(issue["createdAt"]),
       updated_at: parse_datetime(issue["updatedAt"])
     }
@@ -515,29 +517,50 @@ defmodule SymphonyElixir.Linear.Client do
   defp project_field(%{} = project, field) when is_binary(field), do: project[field]
   defp project_field(_project, _field), do: nil
 
-  defp assigned_to_worker?(_assignee, nil), do: true
+  # An issue is routed to this worker when no routing filter is configured, or
+  # when it matches EITHER the configured assignee OR any configured label.
+  defp assigned_to_worker?(_assignee, _labels, nil), do: true
 
-  defp assigned_to_worker?(%{} = assignee, %{match_values: match_values})
-       when is_struct(match_values, MapSet) do
-    assignee
-    |> assignee_id()
-    |> then(fn
-      nil -> false
-      assignee_id -> MapSet.member?(match_values, assignee_id)
-    end)
+  defp assigned_to_worker?(assignee, labels, %{} = routing_filter) do
+    assignee_matches?(assignee, Map.get(routing_filter, :match_values)) or
+      label_matches?(labels, Map.get(routing_filter, :labels))
   end
 
-  defp assigned_to_worker?(_assignee, _assignee_filter), do: false
+  defp assignee_matches?(%{} = assignee, %MapSet{} = match_values) do
+    case assignee_id(assignee) do
+      nil -> false
+      assignee_id -> MapSet.member?(match_values, assignee_id)
+    end
+  end
+
+  defp assignee_matches?(_assignee, _match_values), do: false
+
+  defp label_matches?(labels, %MapSet{} = routing_labels) when is_list(labels) do
+    Enum.any?(labels, &MapSet.member?(routing_labels, &1))
+  end
+
+  defp label_matches?(_labels, _routing_labels), do: false
 
   defp assignee_id(%{} = assignee), do: normalize_assignee_match_value(assignee["id"])
 
-  defp routing_assignee_filter do
-    case Config.settings!().tracker.assignee do
-      nil ->
-        {:ok, nil}
+  defp routing_filter do
+    tracker = Config.settings!().tracker
 
-      assignee ->
-        build_assignee_filter(assignee)
+    assignee_result =
+      case tracker.assignee do
+        nil -> {:ok, nil}
+        assignee -> build_assignee_filter(assignee)
+      end
+
+    with {:ok, assignee_filter} <- assignee_result do
+      {:ok, build_routing_filter(assignee_filter, tracker.labels || [])}
+    end
+  end
+
+  defp build_routing_filter(assignee_filter, labels) do
+    case Schema.normalize_label_list(labels) do
+      [] -> assignee_filter
+      routing_labels -> Map.put(assignee_filter || %{}, :labels, MapSet.new(routing_labels))
     end
   end
 

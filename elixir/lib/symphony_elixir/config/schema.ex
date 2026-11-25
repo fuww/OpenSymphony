@@ -132,6 +132,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:api_key, :string)
       field(:project_slug, :string)
       field(:assignee, :string)
+      field(:labels, {:array, :string}, default: [])
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
 
       field(:terminal_states, {:array, :string},
@@ -146,12 +147,13 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states],
+        [:kind, :endpoint, :api_key, :project_slug, :assignee, :labels, :active_states, :terminal_states],
         empty_values: []
       )
       |> update_change(:kind, &Schema.normalize_optional_string/1)
       |> update_change(:project_slug, &Schema.normalize_optional_string/1)
       |> update_change(:assignee, &Schema.normalize_optional_string/1)
+      |> update_change(:labels, &Schema.normalize_label_list/1)
       |> cast_embed(:projects, with: &TrackerProject.changeset/2)
       |> Schema.validate_unique_tracker_projects()
     end
@@ -1086,6 +1088,16 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   def normalize_string_list(_value), do: []
+
+  # Linear label names are matched case-insensitively; grouped labels use the
+  # same `parent/child` form produced by `Linear.Client`.
+  @spec normalize_label_list(term()) :: [String.t()]
+  def normalize_label_list(value) do
+    value
+    |> normalize_string_list()
+    |> Enum.map(&String.downcase/1)
+    |> Enum.uniq()
+  end
 
   @spec normalize_optional_effort(term()) :: term()
   def normalize_optional_effort(nil), do: nil
